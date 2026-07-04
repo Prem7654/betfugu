@@ -3,23 +3,29 @@
 BetFugu Auto-Register + Free Spin Bot — Telegram + HAR-verified.
 No guessing. Every endpoint, header, body from original HAR file.
 
-KEY FIX: Server uses `access-token` custom header (NOT `Authorization: Bearer`).
-All 20+ custom headers from HAR are now included.
-Body is always `{}` for POST calls (HAR proves bodySize=2, text='{}').
+KEY FIXES:
+1. Server uses `access-token` custom header (NOT `Authorization: Bearer`).
+2. All 20+ custom headers from HAR included.
+3. Body is always `{}` for POST calls (HAR: bodySize=2, text='{}').
+4. REFERRAL FIX: Pre-login indexV4 call with `sourceurl` containing
+   userId, cury, partner, rtm — server tracks referral from this.
+   (HAR Entry 131: sourceurl has userId=2335316 before register)
+   Without this, refer bonus is NOT credited.
 
 Flow (all HAR-verified):
-  0. Follow short refer link -> 302 redirect -> extract partner code
+  0. Follow short refer link -> 302 redirect -> extract partner + userId
+  0a. Pre-login indexV4 with referral sourceurl (HAR Entry 131)
   1. Generate random Indian phone (starts 6/7/8/9, 10 digits)
   2. Register    : POST /user/register/account  (partner, itemuserfor=freespin)
   3. Login      : POST /user/login/account    (returns token)
-  4. Gift status : GET  /opendata/homepage/registGifts  (check claimed=false)
-  5. Homepage   : POST /opendata/homepage/indexV4  (load config)
-  6. Free package: POST /user/profile/getfreepackage  (check package)
-  7. Claim gift  : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
-  8. Free pkg2  : POST /user/profile/getfreepackage  (verify after claim)
-  9. Language   : POST /user/profile/setlanguage  (en-US)
- 10. Subscribe   : POST /freetinygames/freespin/subscribe  (tyid=freespinbet10)
- 11. Play 10x   : POST /freetinygames/freespin/bet  (10 calls, until tycount=0)
+  4. Gift status : GET  /opendata/homepage/registGifts
+  5. Homepage   : POST /opendata/homepage/indexV4
+  6. Free package: POST /user/profile/getfreepackage
+  7. Claim gift  : POST /user/profile/claimRegistGifts
+  8. Free pkg2  : POST /user/profile/getfreepackage
+  9. Language   : POST /user/profile/setlanguage
+ 10. Subscribe   : POST /freetinygames/freespin/subscribe
+ 11. Play 10x   : POST /freetinygames/freespin/bet
 
 Env:
   BOT_TOKEN  — Telegram bot token from @BotFather
@@ -29,6 +35,7 @@ import os
 import re
 import json
 import random
+import time
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -63,8 +70,6 @@ FIXED_PASSWORD = "123456"
 SET_LANGUAGE = "en-US"
 
 # ---- HAR-verified headers for H5 host (h5server.betfuguapi.com) ----
-# These are the EXACT custom headers the browser sends (HAR Entry 283/286/288 etc.)
-# Server REJECTS requests missing these headers (404 Not Found).
 H5_BASE_HEADERS = {
     "accept": "application/json, text/plain, */*",
     "content-type": "application/json;charset=UTF-8",
@@ -98,8 +103,6 @@ H5_BASE_HEADERS = {
 }
 
 # ---- HAR-verified headers for GAME host (game.betfuguapi.com) ----
-# Game host uses DIFFERENT headers (HAR Entry 618/624 etc.)
-# Note: origin/referer use www.betfugu02.com (with www prefix)
 GAME_BASE_HEADERS = {
     "accept": "*/*",
     "content-type": "application/json",
@@ -111,7 +114,6 @@ GAME_BASE_HEADERS = {
     ),
 }
 
-# Redirect link headers (for following short URL -> 302)
 REDIRECT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -121,7 +123,7 @@ REDIRECT_HEADERS = {
 }
 
 
-def call_api(method, host, path, body=None, token=None, partner=None, game=False):
+def call_api(method, host, path, body=None, token=None, partner=None, game=False, sourceurl=None):
     """Make single API call, return (http_status, response_json).
 
     HAR PROOF: All POST calls use body='{}' (bodySize=2). NOT None/empty.
@@ -130,17 +132,14 @@ def call_api(method, host, path, body=None, token=None, partner=None, game=False
     """
     url = host + path
 
-    # HAR shows: POST calls send body='{}', GET calls send no body
     if method == "POST":
         if body is not None:
             data = json.dumps(body).encode("utf-8")
         else:
-            # HAR proves: empty POST calls use body='{}' (bodySize=2)
             data = b"{}"
     else:
         data = None
 
-    # Pick correct header set based on host
     if game or host == GAME_HOST:
         headers = dict(GAME_BASE_HEADERS)
         if token:
@@ -150,8 +149,9 @@ def call_api(method, host, path, body=None, token=None, partner=None, game=False
         if partner:
             headers["partner"] = str(partner)
         if token:
-            # KEY FIX: server uses 'access-token' header, NOT 'Authorization: Bearer'
             headers["access-token"] = token
+        if sourceurl:
+            headers["sourceurl"] = sourceurl
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -202,6 +202,8 @@ def follow_short_link_and_get_partner(short_url):
     params = parse_qs(parsed.query)
     partner = params.get("partner", [None])[0]
     user_id = params.get("userId", [None])[0]
+    cury = params.get("cury", ["INR"])[0]
+    rtm = params.get("rtm", [""])[0]
 
     if not partner or partner == "undefined":
         return None, None, "Partner not found in redirect URL: {}".format(final_url)
@@ -218,10 +220,43 @@ def generate_random_phone():
 
 # ---- BetFugu API steps (all HAR-verified) ----
 
-def step_register(phone, password, partner):
+def step_prelogin_referral_index_v4(partner, user_id, rtm):
+    """HAR Entry 131 - POST /opendata/homepage/indexV4  (BEFORE register, NO token)
+
+    This is the REFERRAL TRACKING call. The browser calls indexV4 BEFORE
+    registering, with sourceurl containing userId, cury, partner, rtm
+    from the redirect URL. Server uses this to track who referred the user.
+
+    HAR proof - Entry 131 sourceurl:
+      https://betfugu02.com/bf_pwa/index.html?userId=2335316&cury=INR&partner=66666666&rtm=1783147761401#/
+
+    Without this call, refer bonus is NOT credited to the referrer.
+    """
+    # Build sourceurl with referrer userId (HAR exact format)
+    if user_id and user_id != "undefined":
+        sourceurl = (
+            "https://betfugu02.com/bf_pwa/index.html"
+            "?userId={}&cury=INR&partner={}&rtm={}#/".format(
+                user_id, partner, rtm)
+        )
+    else:
+        sourceurl = "https://betfugu02.com/bf_pwa/index.html#/"
+
+    status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={},
+                           partner=partner, sourceurl=sourceurl)
+    if status != 200:
+        return False, "Referral track FAIL: HTTP {} {}".format(status, resp)
+    if resp.get("code") != 200:
+        return False, "Referral track FAIL: {}".format(resp)
+    return True, "Referral tracked \u2705 (userId={})".format(user_id)
+
+
+def step_register(phone, password, partner, user_id, rtm):
     """HAR Entry 271 - POST /user/register/account
     Body: {account, password, partner, itemuserfor:"freespin"}
     Response: {"code":200}
+
+    Register sourceurl goes to #/login page (HAR Entry 271).
     """
     body = {
         "account": phone,
@@ -229,19 +264,25 @@ def step_register(phone, password, partner):
         "partner": int(partner),
         "itemuserfor": VERIFIED_ITEMUSERFOR,
     }
-    status, resp = call_api("POST", H5_HOST, PATH_REGISTER, body=body, partner=partner)
+    # HAR Entry 271 sourceurl: https://betfugu02.com/bf_pwa/index.html#/login
+    sourceurl = "https://betfugu02.com/bf_pwa/index.html#/login"
+    status, resp = call_api("POST", H5_HOST, PATH_REGISTER, body=body,
+                           partner=partner, sourceurl=sourceurl)
     if status != 200 or resp.get("code") != 200:
         return False, "Registration FAIL: {}".format(resp)
     return True, "Registered \u2705 (code 200)"
 
 
-def step_login(phone, password, partner):
+def step_login(phone, password, partner, user_id, rtm):
     """HAR Entry 274 - POST /user/login/account
     Body: {account, password}
     Response: {"code":200, "token":"..."}
     """
     body = {"account": phone, "password": password}
-    status, resp = call_api("POST", H5_HOST, PATH_LOGIN, body=body, partner=partner)
+    # After login, sourceurl becomes #/ (no userId)
+    sourceurl = "https://betfugu02.com/bf_pwa/index.html#/"
+    status, resp = call_api("POST", H5_HOST, PATH_LOGIN, body=body,
+                           partner=partner, sourceurl=sourceurl)
     if status != 200 or resp.get("code") != 200:
         return None, "Login FAIL: {}".format(resp)
     token = resp.get("token")
@@ -251,9 +292,7 @@ def step_login(phone, password, partner):
 
 
 def step_check_regist_gifts(token, partner):
-    """HAR Entry 280 - GET /opendata/homepage/registGifts
-    Response: {"code":200,"data":{"claimed":false,"config":{"items":[{"id":"freespinbet10","num":10}]}}}
-    """
+    """HAR Entry 280 - GET /opendata/homepage/registGifts"""
     status, resp = call_api("GET", H5_HOST, PATH_REGIST_GIFTS, token=token, partner=partner)
     if status != 200:
         return False, "Gift status FAIL: HTTP {} {}".format(status, resp)
@@ -265,7 +304,7 @@ def step_check_regist_gifts(token, partner):
 
 
 def step_homepage_index_v4(token, partner):
-    """HAR Entry 286 - POST /opendata/homepage/indexV4
+    """HAR Entry 286 - POST /opendata/homepage/indexV4 (post-login)
     Body: {} (HAR proves bodySize=2, text='{}')
     """
     status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={}, token=token, partner=partner)
@@ -277,11 +316,7 @@ def step_homepage_index_v4(token, partner):
 
 
 def step_get_free_package(token, partner):
-    """HAR Entry 283 - POST /user/profile/getfreepackage  (before claim)
-    Body: {} (HAR proves bodySize=2, text='{}')
-    Response before claim: {"code":200,"freePackage":{},"confs":{}}
-    KEY FIX: uses `access-token` header, NOT `Authorization: Bearer`
-    """
+    """HAR Entry 283 - POST /user/profile/getfreepackage  (before claim)"""
     status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token, partner=partner)
     if status != 200:
         return False, "Free package FAIL: HTTP {} {}".format(status, resp)
@@ -292,7 +327,7 @@ def step_get_free_package(token, partner):
 
 def step_claim_gift(token, partner):
     """HAR Entry 288 - POST /user/profile/claimRegistGifts
-    Body: {} (HAR proves bodySize=2, text='{}')
+    Body: {} (HAR: bodySize=2, text='{}')
     Response: {"code":200,"items":[{"id":"freespinbet10","num":10}]}
     """
     status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body={}, token=token, partner=partner)
@@ -309,10 +344,7 @@ def step_claim_gift(token, partner):
 
 
 def step_get_free_package_after_claim(token, partner):
-    """HAR Entry 293 - POST /user/profile/getfreepackage  (after claim)
-    Body: {} (HAR proves bodySize=2, text='{}')
-    Response: {"code":200,"freePackage":{"freespinbet10":10},"confs":{...}}
-    """
+    """HAR Entry 293 - POST /user/profile/getfreepackage  (after claim)"""
     status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token, partner=partner)
     if status != 200:
         return False, "Free package (after) FAIL: HTTP {} {}".format(status, resp)
@@ -351,7 +383,7 @@ def step_freespin_subscribe(token):
 
 def step_play_spins(token):
     """HAR Entries 624-651 - POST /freetinygames/freespin/bet
-    10 calls. Body: {} (HAR proves bodySize=2, text='{}').
+    10 calls. Body: {} (HAR: bodySize=2, text='{}').
     Response has tycount (remaining spins): 9,8,7,...,0.
     Uses GAME host with game-specific headers.
     """
@@ -378,13 +410,17 @@ def run_full_flow(refer_link):
     """Run complete auto-registration + free spin flow."""
     report = []
 
-    # Step 0 - Follow short link, extract partner
+    # Step 0 - Follow short link, extract partner + userId + rtm
     report.append("\U0001f3b0 BetFugu Auto-Register")
     report.append("Refer link: {}".format(refer_link))
     partner, user_id, redirect_url = follow_short_link_and_get_partner(refer_link)
     if not partner:
         report.append("\u274c Partner extract FAIL: {}".format(redirect_url))
         return False, "\n".join(report)
+    # Extract rtm from redirect URL
+    parsed = urlparse(redirect_url)
+    params = parse_qs(parsed.query)
+    rtm = params.get("rtm", [""])[0]
     report.append("Partner: {} (from 302 redirect)".format(partner))
     if user_id:
         report.append("Referrer userId: {}".format(user_id))
@@ -397,14 +433,31 @@ def run_full_flow(refer_link):
     report.append("Password: {}".format(password))
     report.append("")
 
-    # Step 1 - Register
-    ok, msg = step_register(phone, password, partner)
+    # Step 0a - Pre-login referral tracking (HAR Entry 131)
+    # THIS IS THE KEY FOR REFER BONUS!
+    # Browser calls indexV4 BEFORE register with sourceurl containing userId
+    # Server tracks the referral from this call.
+    if user_id and user_id != "undefined":
+        ok, msg = step_prelogin_referral_index_v4(partner, user_id, rtm)
+        report.append("0\ufe0f\u20e3 Referral track: {}".format(msg))
+        if not ok:
+            # Non-fatal - continue even if this fails
+            report.append("   (continuing anyway...)")
+    else:
+        report.append("0\ufe0f\u20e3 Referral track: Skipped (no userId in refer link)")
+    report.append("")
+
+    # Step 1 - Register (with login sourceurl like HAR Entry 271)
+    ok, msg = step_register(phone, password, partner, user_id, rtm)
     report.append("1\ufe0f\u20e3 Register: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
+    # Small delay to let server process registration
+    time.sleep(0.5)
+
     # Step 2 - Login
-    token, msg = step_login(phone, password, partner)
+    token, msg = step_login(phone, password, partner, user_id, rtm)
     report.append("2\ufe0f\u20e3 Login: {}".format(msg))
     if not token:
         return False, "\n".join(report)
@@ -508,16 +561,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\U0001f4d6 *Help*\n\n"
         "`/register <REFER_LINK>` \u2014 auto register + 10 free spins\n\n"
         "Bot kya karta hai:\n"
-        "\u2022 Short refer link follow -> 302 redirect -> partner code extract\n"
+        "\u2022 Short refer link follow -> 302 redirect -> partner + userId extract\n"
+        "\u2022 Pre-login indexV4 with referral sourceurl (refer bonus track)\n"
         "\u2022 Random 10-digit phone (6/7/8/9 se start)\n"
         "\u2022 Password: 123456\n"
         "\u2022 Register -> Login -> Gift check -> Homepage -> Free pkg -> Claim -> Play 10 spins\n\n"
         "Example:\n"
-        "`/register https://s.betfugu01.com/ezzwvl51eipuy39`\n\n"
-        "HAR-verified headers (key fix):\n"
-        "\u2022 access-token header (NOT Authorization: Bearer)\n"
-        "\u2022 25+ custom headers: appid, channel, currency, version, partner...\n"
-        "\u2022 body={} for all POST calls",
+        "`/register https://s.betfugu01.com/ezzwvl51eipuy39`",
         parse_mode="Markdown",
     )
 
