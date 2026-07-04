@@ -85,12 +85,23 @@ REDIRECT_HEADERS = {
 
 
 def call_api(method, host, path, body=None, token=None, extra_params=None):
-    """Make single API call, return (http_status, response_json)."""
+    """Make single API call, return (http_status, response_json).
+
+    Key: if body is None, urllib sends NO request body at all.
+    If body is {}, urllib sends b'{}' which some BetFugu endpoints reject with 404.
+    HAR proves: getfreepackage, claimRegistGifts, indexV4, freespin/bet
+    have NO request body section → must use body=None.
+    """
     url = host + path
     if extra_params:
         url += "?" + urlencode(extra_params)
 
-    data = json.dumps(body).encode("utf-8") if body is not None else None
+    # Only send data if body is explicitly not None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    else:
+        data = None
+
     headers = dict(COMMON_HEADERS)
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -213,10 +224,10 @@ def step_check_regist_gifts(token):
 
 def step_homepage_index_v4(token):
     """HAR Entry 286 — POST /opendata/homepage/indexV4
-    Loads homepage config. No specific request body in HAR (empty or minimal).
+    Loads homepage config. HAR shows NO request body → use body=None.
     Must be called before claim — server expects this sequence.
     """
-    status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={}, token=token)
+    status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body=None, token=token)
     if status != 200:
         return False, "Homepage FAIL: HTTP {} {}".format(status, resp)
     if resp.get("code") != 200:
@@ -227,9 +238,10 @@ def step_homepage_index_v4(token):
 def step_get_free_package(token):
     """HAR Entry 283 — POST /user/profile/getfreepackage  (before claim)
     Response before claim: {"code":200,"freePackage":{},"confs":{}}
-    Must be called before claim — server expects this.
+    HAR shows NO request body section → must use body=None (not {}).
+    Sending body={} causes 404 Not Found.
     """
-    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token)
+    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body=None, token=token)
     if status != 200:
         return False, "Free package FAIL: HTTP {} {}".format(status, resp)
     if resp.get("code") != 200:
@@ -240,8 +252,9 @@ def step_get_free_package(token):
 def step_claim_gift(token):
     """HAR Entry 288 — POST /user/profile/claimRegistGifts
     Response: {"code":200,"items":[{"id":"freespinbet10","num":10}]}
+    HAR shows NO request body section → must use body=None (not {}).
     """
-    status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body={}, token=token)
+    status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body=None, token=token)
     if status != 200:
         return False, "Claim gift FAIL: HTTP {} {}".format(status, resp)
     if resp.get("code") != 200:
@@ -257,9 +270,9 @@ def step_claim_gift(token):
 def step_get_free_package_after_claim(token):
     """HAR Entry 293 — POST /user/profile/getfreepackage  (after claim)
     Response after claim: {"code":200,"freePackage":{"freespinbet10":10},"confs":{...}}
-    Verifies the gift was successfully claimed.
+    HAR shows NO request body → use body=None.
     """
-    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token)
+    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body=None, token=token)
     if status != 200:
         return False, "Free package (after) FAIL: HTTP {} {}".format(status, resp)
     if resp.get("code") != 200:
@@ -273,6 +286,7 @@ def step_get_free_package_after_claim(token):
 def step_set_language(token):
     """HAR Entry 298 — POST /user/profile/setlanguage
     Body: {"language":"en-US"}
+    HAR shows explicit request body → use body={"language":"en-US"}
     """
     body = {"language": SET_LANGUAGE}
     status, resp = call_api("POST", H5_HOST, PATH_SET_LANGUAGE, body=body, token=token)
@@ -286,6 +300,7 @@ def step_set_language(token):
 def step_freespin_subscribe(token):
     """HAR Entry 618 — POST /freetinygames/freespin/subscribe
     Body: {"tyid":"freespinbet10"}
+    HAR shows explicit request body → use body={"tyid":"freespinbet10"}
     """
     body = {"tyid": SUBSCRIBE_TYID}
     status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_SUBSCRIBE, body=body, token=token)
@@ -298,7 +313,7 @@ def step_play_spins(token):
     """HAR Entries 624-651 — POST /freetinygames/freespin/bet
     10 calls. Each response has tycount (remaining spins).
     HAR proves: starts at tycount=9 (after 1st bet), ends at tycount=0.
-    No request body required (HAR shows no request body for bet calls).
+    HAR shows NO request body → use body=None.
     """
     results = []
     total_win = 0
@@ -355,21 +370,18 @@ def run_full_flow(refer_link):
         return False, "\n".join(report)
 
     # Step 3 — Check gift status (HAR Entry 280)
-    # MUST be called before claim — server expects this
     ok, msg = step_check_regist_gifts(token)
     report.append("3️⃣ Gift status: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
     # Step 4 — Homepage config (HAR Entry 286)
-    # MUST be called before claim — server expects this
     ok, msg = step_homepage_index_v4(token)
     report.append("4️⃣ Homepage: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
     # Step 5 — Free package check (HAR Entry 283 — before claim)
-    # MUST be called before claim — server expects this
     ok, msg = step_get_free_package(token)
     report.append("5️⃣ Free package (pre): {}".format(msg))
     if not ok:
