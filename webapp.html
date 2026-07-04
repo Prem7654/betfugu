@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BetFugu Auto-Register</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,sans-serif}
+body{background:#0f0f1e;color:#e0e0e0;padding:16px;max-width:600px;margin:0 auto}
+h1{font-size:1.5rem;text-align:center;margin:12px 0 8px}
+.sub{text-align:center;color:#888;font-size:0.85rem;margin-bottom:16px}
+input{width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#1a1a2e;color:#fff;font-size:0.9rem;margin-bottom:8px}
+button{width:100%;padding:14px;border:none;border-radius:8px;background:linear-gradient(135deg,#6c3ce1,#a23ce1);color:#fff;font-size:1.1rem;font-weight:bold;cursor:pointer;margin-bottom:16px}
+button:disabled{opacity:0.5;cursor:not-allowed}
+#log{background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:12px;font-size:0.8rem;font-family:monospace;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.6}
+.log-ok{color:#4ade80}
+.log-fail{color:#f87171}
+.log-info{color:#60a5fa}
+.log-step{color:#fbbf24;font-weight:bold}
+.log-done{color:#4ade80;font-weight:bold;font-size:1rem}
+.ipbox{background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:10px;text-align:center;margin-bottom:12px;font-size:0.85rem}
+.ipbox span{color:#4ade80;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>🎰 BetFugu Auto-Register</h1>
+<div class="sub">Browser-based | Phone IP direct | No proxy needed</div>
+<div class="ipbox">Your IP: <span id="myip">checking...</span></div>
+<input id="referLink" type="text" placeholder="Refer link: https://s.betfugu01.com/ezzwvl51eipuy39" value="">
+<button id="goBtn" onclick="startBot()">Start Auto-Register</button>
+<div id="log"></div>
+
+<script>
+const H5 = 'https://h5server.betfuguapi.com';
+const GAME = 'https://game.betfuguapi.com';
+const PWD = '123456';
+const AES_KEY = '34d80508ab4a03043f014a66840ba23w';
+const AES_IV = '585280b3543d2d89';
+const VISITOR_ID = 'MB==d9f771e6f02f464acd2a8ae95601599ff40dfc88202627';
+let logEl = document.getElementById('log');
+let userIP = 'unknown';
+
+function log(msg, cls) {
+  const d = document.createElement('div');
+  d.className = cls || '';
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+async function getIP() {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const j = await r.json();
+    userIP = j.ip;
+    document.getElementById('myip').textContent = userIP;
+    log('IP detected: ' + userIP, 'log-info');
+  } catch(e) {
+    document.getElementById('myip').textContent = 'failed';
+    log('IP detection failed, using webrtc header anyway', 'log-fail');
+  }
+}
+
+function genPwaUUID() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+function genPhone() {
+  const first = '6789'[Math.floor(Math.random()*4)];
+  let rest = '';
+  for (let i=0; i<9; i++) rest += Math.floor(Math.random()*10);
+  return first + rest;
+}
+
+async function aesEncrypt(text) {
+  const keyData = new TextEncoder().encode(AES_KEY);
+  const ivData = new TextEncoder().encode(AES_IV);
+  const data = new TextEncoder().encode(text);
+  const key = await crypto.subtle.importKey('raw', keyData, {name:'AES-CBC'}, false, ['encrypt']);
+  const enc = await crypto.subtle.encrypt({name:'AES-CBC', iv:ivData}, key, data);
+  return btoa(String.fromCharCode(...new Uint8Array(enc)));
+}
+
+function buildSourceURL(userId, partner, rtm, pwaUUID, frag) {
+  let p = 'cury=INR&partner='+partner+'&rtm='+rtm;
+  if (userId && userId !== 'undefined') p = 'userId='+userId+'&'+p;
+  if (pwaUUID) p += '&pwa_uuid='+pwaUUID;
+  return 'https://betfugu02.com/bf_pwa/index.html?'+p+(frag||'#/');
+}
+
+function h5Headers(token, partner, sourceurl) {
+  const h = {
+    'accept':'application/json, text/plain, */*',
+    'content-type':'application/json;charset=UTF-8',
+    'origin':'https://betfugu02.com',
+    'referer':'https://betfugu02.com/',
+    'user-agent':navigator.userAgent,
+    'language':'en-US','appid':'wecardgame','channel':'test','currency':'INR',
+    'version':'2.11.56','timezone':'Asia/Calcutta','timeoffset':'-330',
+    'network':'4g','publisher':'release','platform':'Unknown','basepkgname':'h5',
+    'pkgname':'h5','osv':'10','weblang':'en-US','weblangs':'en-US,en,en-IN',
+    'isfrom':'other_h5','ispwa':'true','webfonts':'Microsoft YaHei','deviceid':'',
+    'visitorid':VISITOR_ID,'sourceurl':sourceurl||'https://betfugu02.com/bf_pwa/index.html#/',
+    'webrtc':userIP,'trackertoken':'','trackername':''
+  };
+  if (partner) h['partner']=String(partner);
+  if (token) h['access-token']=token;
+  return h;
+}
+
+function gameHeaders(token) {
+  const h = {
+    'accept':'*/*','content-type':'application/json',
+    'origin':'https://www.betfugu02.com','referer':'https://www.betfugu02.com/',
+    'user-agent':navigator.userAgent
+  };
+  if (token) h['access-token']=token;
+  return h;
+}
+
+async function apiCall(method, host, path, body, token, partner, isGame, sourceurl) {
+  const url = host + path;
+  const opts = {method, headers: isGame ? gameHeaders(token) : h5Headers(token, partner, sourceurl)};
+  if (method === 'POST') opts.body = JSON.stringify(body || {});
+  try {
+    const r = await fetch(url, opts);
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); } catch { j = {_raw:text}; }
+    return {status:r.status, data:j};
+  } catch(e) {
+    return {status:0, data:{error:String(e)}};
+  }
+}
+
+async function followRedirect(shortUrl) {
+  try {
+    const r = await fetch(shortUrl, {redirect:'manual', headers:{'User-Agent':navigator.userAgent}});
+    const loc = r.headers.get('location') || r.url;
+    if (loc && loc !== shortUrl) return loc;
+    if (r.status === 0 || r.type === 'opaqueredirect') {
+      throw new Error('CORS blocked redirect - need server proxy');
+    }
+    return loc;
+  } catch(e) {
+    throw e;
+  }
+}
+
+function parseQuery(url) {
+  const sp = new URLSearchParams(new URL(url).search);
+  return {
+    partner: sp.get('partner'),
+    userId: sp.get('userId'),
+    rtm: sp.get('rtm') || ''
+  };
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function startBot() {
+  const btn = document.getElementById('goBtn');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  logEl.innerHTML = '';
+  const referLink = document.getElementById('referLink').value.trim();
+  if (!referLink) { log('Please enter refer link!', 'log-fail'); btn.disabled=false; btn.textContent='Start Auto-Register'; return; }
+
+  log('🎰 BetFugu Auto-Register', 'log-done');
+  log('Refer: ' + referLink, 'log-info');
+  await getIP();
+  log('','');
+
+  // 1. Follow short link
+  log('Following short link...', 'log-step');
+  let partner, userId, rtm, finalUrl;
+  try {
+    finalUrl = await followRedirect(referLink);
+    const q = parseQuery(finalUrl);
+    partner = q.partner;
+    userId = q.userId;
+    rtm = q.rtm;
+    log('Partner: ' + partner, 'log-ok');
+    if (userId) log('Referrer userId: ' + userId, 'log-ok');
+  } catch(e) {
+    log('Redirect FAIL: ' + e.message + ' - trying manual parse', 'log-fail');
+    try {
+      const q = parseQuery(referLink);
+      partner = q.partner;
+      userId = q.userId;
+      rtm = q.rtm || String(Date.now());
+      if (!partner) throw new Error('no partner in URL');
+      log('Partner (manual): ' + partner, 'log-ok');
+    } catch(e2) {
+      log('Cannot parse refer link: ' + e2.message, 'log-fail');
+      btn.disabled=false; btn.textContent='Start Auto-Register'; return;
+    }
+  }
+  log('','');
+
+  const pwaUUID = genPwaUUID();
+  log('pwa_uuid: ' + pwaUUID, 'log-info');
+  const phone = genPhone();
+  log('Phone: ' + phone, 'log-info');
+  log('Password: ' + PWD + ' (AES)', 'log-info');
+  log('','');
+
+  const srcNoUUID = buildSourceURL(userId, partner, rtm, null, '#/');
+  const srcUUID = buildSourceURL(userId, partner, rtm, pwaUUID, '#/');
+  const srcLogin = buildSourceURL(userId, partner, rtm, pwaUUID, '#/login');
+
+  // Pre-login sequence
+  log('--- Pre-login sequence ---', 'log-step');
+  await sleep(1000);
+  const r1 = await apiCall('POST', H5, '/shorturl', {text:'https://betfugu02.com/app/index.html?userId=undefined&cury=INR&partner=undefined&rtm='+Date.now()});
+  log('shorturl(1): ' + (r1.status===200?'OK':'FAIL '+r1.status), r1.status===200?'log-ok':'log-fail');
+
+  const r2 = await apiCall('POST', H5, '/opendata/getdaylyjackpot', {id:'daylyJackpot',version:'1'}, null, partner, false, srcNoUUID);
+  log('daylyJackpot: ' + (r2.status===200?'OK':'FAIL'), r2.status===200?'log-ok':'log-fail');
+
+  const r3 = await apiCall('POST', H5, '/opendata/homepage/indexV4', {}, null, partner, false, srcNoUUID);
+  log('indexV4 (no uuid): ' + (r3.status===200?'OK':'FAIL'), r3.status===200?'log-ok':'log-fail');
+  await sleep(1000);
+
+  const r4 = await apiCall('POST', H5, '/shorturl', {text:'https://betfugu02.com/app/index.html?userId=undefined&cury=INR&partner=undefined&rtm='+Date.now()});
+  log('shorturl(2): ' + (r4.status===200?'OK':'FAIL'), r4.status===200?'log-ok':'log-fail');
+
+  const r5 = await apiCall('POST', H5, '/opendata/homepage/indexV4', {}, null, partner, false, srcUUID);
+  log('indexV4 (uuid): ' + (r5.status===200?'OK':'FAIL'), r5.status===200?'log-ok':'log-fail');
+
+  const r6 = await apiCall('POST', H5, '/opendata/getdaylyjackpot', {id:'daylyJackpot',version:'1'}, null, partner, false, srcUUID);
+  log('daylyJackpot(2): ' + (r6.status===200?'OK':'FAIL'), r6.status===200?'log-ok':'log-fail');
+
+  const r7 = await apiCall('GET', H5, '/opendata/gameConfigs', null, null, partner, false, srcUUID);
+  log('gameConfigs: ' + (r7.status===200?'OK':'FAIL'), r7.status===200?'log-ok':'log-fail');
+  await sleep(1000);
+
+  const r8 = await apiCall('POST', H5, '/opendata/itemConfig', {}, null, partner, false, srcLogin);
+  log('itemConfig: ' + (r8.status===200?'OK':'FAIL'), r8.status===200?'log-ok':'log-fail');
+  log('','');
+
+  await sleep(3000);
+
+  // AES encrypt
+  log('Encrypting password...', 'log-step');
+  let encPwd;
+  try {
+    encPwd = await aesEncrypt(PWD);
+    log('AES encrypt: ✅ ' + encPwd, 'log-ok');
+  } catch(e) {
+    log('AES FAIL: ' + e.message, 'log-fail');
+    btn.disabled=false; btn.textContent='Start Auto-Register'; return;
+  }
+  log('','');
+
+  // Register
+  log('--- Register ---', 'log-step');
+  const regBody = {account:phone, password:encPwd, partner:parseInt(partner), itemuserfor:'freespin'};
+  log('Body: ' + JSON.stringify(regBody), 'log-info');
+  const rr = await apiCall('POST', H5, '/user/register/account', regBody, null, partner, false, srcLogin);
+  if (rr.status !== 200 || rr.data.code !== 200) {
+    log('Register FAIL: ' + JSON.stringify(rr.data), 'log-fail');
+    btn.disabled=false; btn.textContent='Start Auto-Register'; return;
+  }
+  log('1️⃣ Register: ✅', 'log-ok');
+  await sleep(1000);
+
+  // Login
+  const lr = await apiCall('POST', H5, '/user/login/account', {account:phone, password:encPwd}, null, partner, false, srcLogin);
+  if (lr.status !== 200 || lr.data.code !== 200) {
+    log('Login FAIL: ' + JSON.stringify(lr.data), 'log-fail');
+    btn.disabled=false; btn.textContent='Start Auto-Register'; return;
+  }
+  const token = lr.data.token;
+  if (!token) {
+    log('Login FAIL: no token', 'log-fail');
+    btn.disabled=false; btn.textContent='Start Auto-Register'; return;
+  }
+  log('2️⃣ Login: ✅', 'log-ok');
+  await sleep(500);
+
+  // Post-register flow
+  log('--- Post-register ---', 'log-step');
+  const gr = await apiCall('GET', H5, '/opendata/homepage/registerGifts', null, token, partner, false, srcUUID);
+  log('3️⃣ Gift status: ' + (gr.status===200?'OK':'FAIL'), gr.status===200?'log-ok':'log-fail');
+
+  const fp = await apiCall('POST', H5, '/user/profile/getfreepackage', {}, token, partner, false, srcUUID);
+  log('4️⃣ Free package: ' + (fp.status===200?'OK':'FAIL'), fp.status===200?'log-ok':'log-fail');
+
+  const hp = await apiCall('POST', H5, '/opendata/homepage/indexV4', {}, token, partner, false, srcUUID);
+  log('5️⃣ Homepage: ' + (hp.status===200?'OK':'FAIL'), hp.status===200?'log-ok':'log-fail');
+
+  const cg = await apiCall('POST', H5, '/user/profile/claimRegisterGifts', {}, token, partner, false, srcUUID);
+  log('6️⃣ Claim gift: ' + (cg.status===200?'OK':'FAIL'), cg.status===200?'log-ok':'log-fail');
+  if (cg.status===200 && cg.data.items) log('   Items: ' + JSON.stringify(cg.data.items), 'log-info');
+
+  const sl = await apiCall('POST', H5, '/user/profile/setlanguage', {language:'en-US'}, token, partner, false, srcUUID);
+  log('7️⃣ Language: ' + (sl.status===200?'OK':'FAIL'), sl.status===200?'log-ok':'log-fail');
+
+  const sub = await apiCall('POST', GAME, '/freetinygames/freespin/subscribe', {typeid:'freespinbet10'}, token, null, true);
+  log('8️⃣ Subscribe: ' + (sub.status===200?'OK':'FAIL'), sub.status===200?'log-ok':'log-fail');
+  log('','');
+
+  // Play 10 free spins
+  log('--- Playing 10 free spins ---', 'log-step');
+  let totalWin = 0;
+  for (let i = 0; i < 10; i++) {
+    const sr = await apiCall('POST', GAME, '/freetinygames/freespin/bet', {}, token, null, true);
+    if (sr.status !== 200) {
+      log('Spin ' + (i+1) + ': FAIL HTTP ' + sr.status, 'log-fail');
+      break;
+    }
+    const lottery = sr.data.lotteryGameResult || {};
+    const gd = lottery.data || {};
+    const win = gd.win || 0;
+    const bal = gd.balance || '?';
+    const tycount = sr.data.tycount || '?';
+    totalWin += (typeof win === 'number') ? win : 0;
+    log('Spin ' + (i+1) + '/10: win=' + win + ' bal=' + bal + ' left=' + tycount, 'log-info');
+    if (tycount === 0 && i < 9) { log('No spins left!', 'log-fail'); break; }
+    await sleep(1000);
+  }
+  log('','');
+  log('Total win: ' + totalWin, 'log-done');
+  log('✅ Done! Registration + 10 free spins complete.', 'log-done');
+  log('Phone: ' + phone + ' | Password: 123456', 'log-info');
+  btn.disabled = false;
+  btn.textContent = 'Start Auto-Register';
+}
+
+getIP();
+</script>
+</body>
+</html>
