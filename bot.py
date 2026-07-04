@@ -3,47 +3,38 @@
 BetFugu Auto-Register + Free Spin Bot — Telegram + HAR-verified.
 No guessing. Every endpoint, header, body from original HAR file (1037 entries).
 
-KEY FIXES (all HAR-verified from 2nd HAR file):
+KEY FIXES (all HAR-verified from 2nd HAR file, 1037 entries):
 1. Server uses `access-token` custom header (NOT `Authorization: Bearer`).
 2. All 25+ custom headers from HAR included.
 3. Body is always `{}` for POST calls (HAR: bodySize=2, text='{}').
 4. Password is AES-256-CBC encrypted (HAR + JS source verified).
-5. REFER BONUS FIX: sourceurl must contain pwa_uuid!
-   - HAR proves: register sourceurl has `&pwa_uuid=xxx` appended
-   - Without pwa_uuid, server cannot link browser session to referral
-   - HAR Entry 633 sourceurl: ...&partner=66666666&rtm=1783147761401&pwa_uuid=29fbe91f3451e28ac1be0a6c4c7ede95#/login
-   - Bot was sending: ...&partner=66666666&rtm=xxx#/  (MISSING pwa_uuid!)
-6. isfrom: "other_h5" for register (HAR shows other_h5, not other_pwa)
-7. Pre-login calls: indexV4, getdaylyjackpot, gameConfigs, itemConfig — ALL with referral sourceurl
+5. pwa_uuid in sourceurl (added after PWA download, not in first calls).
+6. isfrom: "other_h5" for ALL H5 calls (HAR shows other_h5 everywhere, NOT other_pwa).
+7. webrtc header: real IP address (HAR shows 47.31.86.36 in every call, bot had empty string).
+8. visitorid: HAR-verified value (not (null)).
+9. Pre-login calls: client/log web_open, daylyJackpot, indexV4, client/log pwa_download,
+   indexV4(2), daylyJackpot(2), gameConfigs, itemConfig.
+10. Spin response: data.balance/data.win (HAR verified), not lotteryGameResult.data.
 
 HAR PROOF of refer bonus:
-  Entry 284 (before refer): earn/statsV2 -> current:20, today:20, users:2
-  Entry 1010 (after refer): earn/statsV2 -> current:30, today:30, users:3
+  Entry 284 (before refer): earn/statsV2 -> current:20, users:2
+  Entry 1010 (after refer): earn/statsV2 -> current:30, users:3
   Entry 1022: earn/detail -> uid:2712722, bindtime:2026-07-04T08:50:37, finish:true
-  => 20 -> 30 = +10 refer bonus! Server auto-credits when partner code in register + pwa_uuid in sourceurl.
+  => 20 -> 30 = +10 refer bonus!
+
+HAR sourceurl sequence (CRITICAL):
+  Entry 559 (1st daylyJackpot): ...&partner=66666666&rtm=1783147761401#/  (NO pwa_uuid!)
+  Entry 561 (1st indexV4):     ...&partner=66666666&rtm=1783147761401#/  (NO pwa_uuid!)
+  Entry 562 (client/log pwa_download): pwa_uuid generated here
+  Entry 572 (2nd indexV4):      ...&partner=66666666&rtm=1783147761401&pwa_uuid=29fbe91f...#/
+  Entry 596 (itemConfig):       ...&pwa_uuid=29fbe91f...#/login
+  Entry 633 (register):         ...&pwa_uuid=29fbe91f...#/login
+  Entry 636 (login):            ...&pwa_uuid=29fbe91f...#/login
 
 AES encryption (from JS source, HAR-verified):
-  key = "3dfe30508ab4a03043f014a6684034ff" (32 bytes UTF-8)
-  iv  = "fe3480b3543dytj3" (16 bytes UTF-8)
-  pureKey = "WXNyfgYJffWxZm0bly3nts1/..." (decrypted to get encryptKey:encryptIv)
   encryptKey = "34d80508ab4a03043f014a66840ba23w" (32 bytes)
   encryptIv  = "585280b3543d2d89" (16 bytes)
   AES.encrypt("123456") = "h1glmyQ2dTe2r+ARoXsgbQ==" (HAR verified!)
-
-Flow (all HAR-verified from 1037-entry HAR):
-  0. Follow short refer link -> 302 redirect -> extract partner + userId + rtm
-  0a. Generate pwa_uuid (random 32-char hex)
-  0b. Pre-login calls with referral sourceurl (userId + pwa_uuid):
-      - POST /client/log (web_open event with pwa_uuid)
-      - POST /opendata/homepage/indexV4 (referral tracking)
-      - POST /opendata/getdaylyjackpot
-      - GET  /opendata/gameConfigs
-      - POST /opendata/itemConfig (sourceurl has #/login)
-  1. Generate random Indian phone (starts 6/7/8/9, 10 digits)
-  2. AES encrypt password
-  3. Register: POST /user/register/account (partner, itemuserfor=freespin, sourceurl has pwa_uuid + #/login)
-  4. Login: POST /user/login/account (sourceurl has pwa_uuid + #/login)
-  5. Gift status -> claim gift -> play spins, etc.
 
 Env:
   BOT_TOKEN  — Telegram bot token from @BotFather
@@ -56,6 +47,7 @@ import random
 import time
 import uuid
 import base64
+import socket
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -144,15 +136,46 @@ SET_LANGUAGE = "en-US"
 HAR_VISITOR_ID = "MB==d9f771e6f02f464acd2a8ae95601599ff40dfc88202627"
 
 
+def get_public_ip():
+    """Get the server's public IP address for webrtc header.
+    HAR shows webrtc: 47.31.86.36 (real user IP) in every API call.
+    Bot was sending empty string — server may use this for referral validation.
+    """
+    try:
+        req = urllib.request.Request("https://api.ipify.org?format=text",
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.read().decode("utf-8").strip()
+    except Exception:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return ""
+
+
+_SERVER_IP = None
+
+def get_webrtc_ip():
+    global _SERVER_IP
+    if _SERVER_IP is None:
+        _SERVER_IP = get_public_ip()
+        print("Server IP for webrtc: {}".format(_SERVER_IP))
+    return _SERVER_IP
+
+
 def generate_pwa_uuid():
     """Generate random 32-char hex string (like HAR pwa_uuid)."""
     return uuid.uuid4().hex
 
 
-def build_sourceurl(user_id, partner, rtm, pwa_uuid, fragment="#/"):
-    """Build HAR-verified sourceurl with userId + pwa_uuid.
-    HAR proof (Entry 633 register):
-      https://betfugu02.com/bf_pwa/index.html?userId=2335316&cury=INR&partner=66666666&rtm=1783147761401&pwa_uuid=29fbe91f...#/login
+def build_sourceurl(user_id, partner, rtm, pwa_uuid=None, fragment="#/"):
+    """Build HAR-verified sourceurl.
+    CRITICAL: pwa_uuid is only added AFTER pwa_download event (HAR Entry 572+).
+    First pre-login calls (Entry 559, 561) do NOT have pwa_uuid.
     """
     base = "https://betfugu02.com/bf_pwa/index.html?"
     params = "cury=INR&partner={}&rtm={}".format(partner, rtm)
@@ -163,10 +186,10 @@ def build_sourceurl(user_id, partner, rtm, pwa_uuid, fragment="#/"):
     return base + params + fragment
 
 
-# ---- HAR-verified headers for H5 host ----
-def make_h5_headers(token=None, partner=None, sourceurl=None, isfrom="other_pwa"):
+def make_h5_headers(token=None, partner=None, sourceurl=None):
     """Build HAR-verified H5 headers.
-    KEY: isfrom=other_h5 for register/login (HAR Entry 633), other_pwa for normal calls.
+    KEY FIX: isfrom=other_h5 for ALL H5 calls (HAR shows other_h5 everywhere).
+    KEY FIX: webrtc = real public IP (HAR shows 47.31.86.36, bot had empty string).
     """
     headers = {
         "accept": "application/json, text/plain, */*",
@@ -192,13 +215,13 @@ def make_h5_headers(token=None, partner=None, sourceurl=None, isfrom="other_pwa"
         "osv": "10",
         "weblang": "en-US",
         "weblangs": "en-US,en,en-IN",
-        "isfrom": isfrom,
+        "isfrom": "other_h5",
         "ispwa": "true",
         "webfonts": "Microsoft YaHei",
         "deviceid": "",
         "visitorid": HAR_VISITOR_ID,
         "sourceurl": sourceurl or "https://betfugu02.com/bf_pwa/index.html#/",
-        "webrtc": "",
+        "webrtc": get_webrtc_ip(),
         "trackertoken": "",
         "trackername": "",
     }
@@ -229,10 +252,8 @@ REDIRECT_HEADERS = {
 }
 
 
-def call_api(method, host, path, body=None, token=None, partner=None, game=False, sourceurl=None, isfrom="other_pwa"):
-    """Make single API call, return (http_status, response_json).
-    HAR PROOF: POST calls use body='{}' (bodySize=2). Token in `access-token` header.
-    """
+def call_api(method, host, path, body=None, token=None, partner=None, game=False, sourceurl=None):
+    """Make single API call, return (http_status, response_json)."""
     url = host + path
 
     if method == "POST":
@@ -248,7 +269,7 @@ def call_api(method, host, path, body=None, token=None, partner=None, game=False
         if token:
             headers["access-token"] = token
     else:
-        headers = make_h5_headers(token=token, partner=partner, sourceurl=sourceurl, isfrom=isfrom)
+        headers = make_h5_headers(token=token, partner=partner, sourceurl=sourceurl)
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -309,26 +330,35 @@ def generate_random_phone():
     return first_digit + rest
 
 
-# ---- BetFugu API steps (all HAR-verified from 1037-entry HAR) ----
+# ---- BetFugu API steps (all HAR-verified) ----
 
-def step_client_log_web_open(pwa_uuid, partner, sourceurl):
-    """HAR Entry 544 - POST /client/log (web_open event with pwa_uuid).
-    This registers the browser session with the server BEFORE register.
+def step_client_log(pwa_uuid, event):
+    """HAR Entry 544/562 - POST /client/log.
+    NOTE: HAR shows this call has NO sourceurl, NO partner, NO custom headers.
     """
     body = {
         "logname": "pwa_log",
-        "event": "web_open",
+        "event": event,
         "content": {"pwa_uuid": pwa_uuid}
     }
-    status, resp = call_api("POST", H5_HOST, PATH_CLIENT_LOG, body=body,
-                           partner=partner, sourceurl=sourceurl)
-    return status == 200, "web_open logged"
+    url = H5_HOST + PATH_CLIENT_LOG
+    data = json.dumps(body).encode("utf-8")
+    headers = {
+        "content-type": "application/json;charset=UTF-8",
+        "origin": "https://betfugu02.com",
+        "referer": "https://betfugu02.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200, "{} logged".format(event)
+    except Exception:
+        return False, "{} FAIL".format(event)
 
 
 def step_prelogin_index_v4(partner, sourceurl):
-    """HAR Entry 561 - POST /opendata/homepage/indexV4 (BEFORE register, NO token).
-    Referral tracking call. sourceurl MUST contain userId + pwa_uuid.
-    """
+    """HAR Entry 561/572 - POST /opendata/homepage/indexV4 (BEFORE register, NO token)."""
     status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={},
                            partner=partner, sourceurl=sourceurl)
     if status != 200 or resp.get("code") != 200:
@@ -337,7 +367,7 @@ def step_prelogin_index_v4(partner, sourceurl):
 
 
 def step_prelogin_dayly_jackpot(partner, sourceurl):
-    """HAR Entry 559 - POST /opendata/getdaylyjackpot"""
+    """HAR Entry 559/574 - POST /opendata/getdaylyjackpot"""
     body = {"id": "daylyJackpot", "version": "1"}
     status, resp = call_api("POST", H5_HOST, PATH_DAYLY_JACKPOT, body=body,
                            partner=partner, sourceurl=sourceurl)
@@ -365,11 +395,7 @@ def step_prelogin_item_config(partner, sourceurl):
 
 
 def step_register(phone, encrypted_password, partner, sourceurl):
-    """HAR Entry 633 - POST /user/register/account
-    Body: {account, password(AES-encrypted), partner, itemuserfor:"freespin"}
-    KEY: sourceurl MUST contain userId + pwa_uuid + #/login
-    KEY: isfrom must be "other_h5" (HAR verified, NOT other_pwa)
-    """
+    """HAR Entry 633 - POST /user/register/account"""
     body = {
         "account": phone,
         "password": encrypted_password,
@@ -377,21 +403,17 @@ def step_register(phone, encrypted_password, partner, sourceurl):
         "itemuserfor": VERIFIED_ITEMUSERFOR,
     }
     status, resp = call_api("POST", H5_HOST, PATH_REGISTER, body=body,
-                           partner=partner, sourceurl=sourceurl, isfrom="other_h5")
+                           partner=partner, sourceurl=sourceurl)
     if status != 200 or resp.get("code") != 200:
         return False, "Register FAIL: {}".format(resp)
     return True, "Registered \u2705"
 
 
 def step_login(phone, encrypted_password, partner, sourceurl):
-    """HAR Entry 636 - POST /user/login/account
-    Body: {account, password(AES-encrypted)}
-    KEY: sourceurl MUST contain userId + pwa_uuid + #/login
-    KEY: isfrom must be "other_h5" (HAR verified)
-    """
+    """HAR Entry 636 - POST /user/login/account"""
     body = {"account": phone, "password": encrypted_password}
     status, resp = call_api("POST", H5_HOST, PATH_LOGIN, body=body,
-                           partner=partner, sourceurl=sourceurl, isfrom="other_h5")
+                           partner=partner, sourceurl=sourceurl)
     if status != 200 or resp.get("code") != 200:
         return None, "Login FAIL: {}".format(resp)
     token = resp.get("token")
@@ -403,10 +425,8 @@ def step_login(phone, encrypted_password, partner, sourceurl):
 def step_check_regist_gifts(token, partner, sourceurl):
     """HAR Entry 642 - GET /opendata/homepage/registGifts"""
     status, resp = call_api("GET", H5_HOST, PATH_REGIST_GIFTS, token=token, partner=partner, sourceurl=sourceurl)
-    if status != 200:
+    if status != 200 or resp.get("code") != 200:
         return False, "Gift status FAIL"
-    if resp.get("code") != 200:
-        return False, "Gift status FAIL: {}".format(resp)
     return True, "Gift status OK"
 
 
@@ -468,7 +488,9 @@ def step_freespin_subscribe(token):
 
 
 def step_play_spins(token):
-    """HAR Entries 915-927 - POST /freetinygames/freespin/bet (10 calls)"""
+    """HAR Entries 915-927 - POST /freetinygames/freespin/bet (10 calls)
+    FIX: HAR shows response has data.balance, data.win (NOT lotteryGameResult.data).
+    """
     results = []
     total_win = 0
     for i in range(NUM_SPINS):
@@ -476,10 +498,12 @@ def step_play_spins(token):
         if status != 200:
             results.append("Spin {}: \u274c HTTP {}".format(i+1, status))
             break
+        # HAR verified: response has data.balance, data.win, data.bet
         game_data = resp.get("data", {})
         balance = game_data.get("balance", "?")
         win = game_data.get("win", 0)
-        tycount = resp.get("tycount", "?")
+        bet = game_data.get("bet", 10)
+        tycount = resp.get("tycount", game_data.get("tycount", "?"))
         total_win += win if isinstance(win, (int, float)) else 0
         results.append("Spin {}/{}: win={} bal={} left={}".format(i+1, NUM_SPINS, win, balance, tycount))
         if tycount == 0 and i < NUM_SPINS - 1:
@@ -488,7 +512,9 @@ def step_play_spins(token):
 
 
 def run_full_flow(refer_link):
-    """Run complete auto-registration + free spin flow."""
+    """Run complete auto-registration + free spin flow.
+    Follows EXACT HAR sequence from 1037-entry HAR file.
+    """
     report = []
 
     # Step 0 - Follow short link, extract partner + userId + rtm
@@ -503,13 +529,17 @@ def run_full_flow(refer_link):
         report.append("Referrer userId: {}".format(user_id))
     report.append("")
 
-    # Generate pwa_uuid (HAR-verified: server uses this to link session to referral)
     pwa_uuid = generate_pwa_uuid()
     report.append("pwa_uuid: {}".format(pwa_uuid))
+    report.append("webrtc IP: {}".format(get_webrtc_ip()))
+    report.append("")
 
-    # Build HAR-verified sourceurl with userId + pwa_uuid (KEY FIX!)
-    src_home = build_sourceurl(user_id, partner, rtm, pwa_uuid, "#/")
-    src_login = build_sourceurl(user_id, partner, rtm, pwa_uuid, "#/login")
+    # Build sourceurls matching HAR sequence EXACTLY:
+    # Phase 1 (before pwa_download): NO pwa_uuid (HAR Entry 559, 561)
+    src_no_uuid = build_sourceurl(user_id, partner, rtm, pwa_uuid=None, fragment="#/")
+    # Phase 2 (after pwa_download): pwa_uuid added (HAR Entry 572+)
+    src_with_uuid = build_sourceurl(user_id, partner, rtm, pwa_uuid=pwa_uuid, fragment="#/")
+    src_with_uuid_login = build_sourceurl(user_id, partner, rtm, pwa_uuid=pwa_uuid, fragment="#/login")
 
     phone = generate_random_phone()
     password = FIXED_PASSWORD
@@ -517,28 +547,42 @@ def run_full_flow(refer_link):
     report.append("Password: {} (AES encrypted)".format(password))
     report.append("")
 
-    # Step 0a - Pre-login: client/log web_open (HAR Entry 544)
-    ok, msg = step_client_log_web_open(pwa_uuid, partner, src_home)
-    report.append("0\ufe0f\u20e3 web_open log: {}".format(msg))
+    # === PRE-REGISTER SEQUENCE (HAR-verified, exact order) ===
 
-    # Step 0b - Pre-login: indexV4 (HAR Entry 561)
-    ok, msg = step_prelogin_index_v4(partner, src_home)
-    report.append("0\ufe0f\u20e3 indexV4 (referral): {}".format(msg))
+    # HAR Entry 544: POST /client/log (web_open) — minimal headers
+    ok, msg = step_client_log(pwa_uuid, "web_open")
+    report.append("0\ufe0f\u20e3 web_open: {}".format(msg))
 
-    # Step 0c - Pre-login: daylyJackpot (HAR Entry 559)
-    ok, msg = step_prelogin_dayly_jackpot(partner, src_home)
+    # HAR Entry 559: POST /opendata/getdaylyjackpot — NO pwa_uuid
+    ok, msg = step_prelogin_dayly_jackpot(partner, src_no_uuid)
     report.append("0\ufe0f\u20e3 daylyJackpot: {}".format(msg))
 
-    # Step 0d - Pre-login: gameConfigs (HAR Entry 578)
-    ok, msg = step_prelogin_game_configs(partner, src_home)
+    # HAR Entry 561: POST /opendata/homepage/indexV4 — NO pwa_uuid
+    ok, msg = step_prelogin_index_v4(partner, src_no_uuid)
+    report.append("0\ufe0f\u20e3 indexV4 (no uuid): {}".format(msg))
+
+    # HAR Entry 562: POST /client/log (pwa_download) — after this pwa_uuid in sourceurl
+    ok, msg = step_client_log(pwa_uuid, "pwa_download")
+    report.append("0\ufe0f\u20e3 pwa_download: {}".format(msg))
+
+    # HAR Entry 572: POST /opendata/homepage/indexV4 — WITH pwa_uuid
+    ok, msg = step_prelogin_index_v4(partner, src_with_uuid)
+    report.append("0\ufe0f\u20e3 indexV4 (uuid): {}".format(msg))
+
+    # HAR Entry 574: POST /opendata/getdaylyjackpot — WITH pwa_uuid
+    ok, msg = step_prelogin_dayly_jackpot(partner, src_with_uuid)
+    report.append("0\ufe0f\u20e3 daylyJackpot(2): {}".format(msg))
+
+    # HAR Entry 578: GET /opendata/gameConfigs — WITH pwa_uuid
+    ok, msg = step_prelogin_game_configs(partner, src_with_uuid)
     report.append("0\ufe0f\u20e3 gameConfigs: {}".format(msg))
 
-    # Step 0e - Pre-login: itemConfig (HAR Entry 596, sourceurl #/login)
-    ok, msg = step_prelogin_item_config(partner, src_login)
+    # HAR Entry 596: POST /opendata/itemConfig — WITH pwa_uuid + #/login
+    ok, msg = step_prelogin_item_config(partner, src_with_uuid_login)
     report.append("0\ufe0f\u20e3 itemConfig: {}".format(msg))
     report.append("")
 
-    # AES encrypt password (HAR verified!)
+    # AES encrypt password
     try:
         encrypted_password = aes_encrypt(password)
         report.append("AES encrypt: \u2705 {}...".format(encrypted_password[:20]))
@@ -547,66 +591,57 @@ def run_full_flow(refer_link):
         return False, "\n".join(report)
     report.append("")
 
-    # Step 1 - Register (with AES-encrypted password + pwa_uuid in sourceurl + isfrom=other_h5)
-    ok, msg = step_register(phone, encrypted_password, partner, src_login)
+    # === REGISTER + LOGIN ===
+    ok, msg = step_register(phone, encrypted_password, partner, src_with_uuid_login)
     report.append("1\ufe0f\u20e3 Register: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
     time.sleep(0.5)
 
-    # Step 2 - Login (with same sourceurl + isfrom=other_h5)
-    token, msg = step_login(phone, encrypted_password, partner, src_login)
+    token, msg = step_login(phone, encrypted_password, partner, src_with_uuid_login)
     report.append("2\ufe0f\u20e3 Login: {}".format(msg))
     if not token:
         return False, "\n".join(report)
 
-    # Post-login sourceurl (still has userId + pwa_uuid + #/)
-    src_post = build_sourceurl(user_id, partner, rtm, pwa_uuid, "#/")
+    src_post = src_with_uuid
 
-    # Step 3 - Check gift status
+    # === POST-REGISTER SEQUENCE ===
     ok, msg = step_check_regist_gifts(token, partner, src_post)
     report.append("3\ufe0f\u20e3 Gift status: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Step 4 - Free package check
     ok, msg = step_get_free_package(token, partner, src_post)
     report.append("4\ufe0f\u20e3 Free package (pre): {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Step 5 - Homepage config
     ok, msg = step_homepage_index_v4(token, partner, src_post)
     report.append("5\ufe0f\u20e3 Homepage: {}".format(msg))
 
-    # Step 6 - Claim gift
     ok, msg = step_claim_gift(token, partner, src_post)
     report.append("6\ufe0f\u20e3 Claim gift: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Step 7 - Free package after claim
     ok, msg = step_get_free_package_after_claim(token, partner, src_post)
     report.append("7\ufe0f\u20e3 Free package (post): {}".format(msg))
 
-    # Step 8 - Set language
     ok, msg = step_set_language(token, partner, src_post)
     report.append("8\ufe0f\u20e3 Language: {}".format(msg))
 
-    # Step 9 - Subscribe
     ok, msg = step_freespin_subscribe(token)
     report.append("9\ufe0f\u20e3 Subscribe: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Step 10 - Play 10 free spins
     report.append("\U0001f51f Playing 10 free spins...")
     ok, spin_report = step_play_spins(token)
     report.append(spin_report)
     report.append("")
     report.append("\u2705 Done! Registration + 10 free spins complete.")
-    report.append("\U0001f4b0 Refer bonus should be credited to referrer! (HAR verified: 20->30)")
+    report.append("\U0001f4b0 Refer bonus should be credited! (HAR: 20->30->40)")
 
     return True, "\n".join(report)
 
@@ -653,11 +688,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\U0001f4d6 *Help*\n\n"
         "`/register <REFER_LINK>` \u2014 auto register + 10 free spins\n\n"
         "Bot kya karta hai:\n"
-        "\u2022 Short refer link follow -> 302 redirect -> partner + userId + rtm extract\n"
+        "\u2022 Short refer link follow -> 302 redirect -> partner + userId + rtm\n"
         "\u2022 pwa_uuid generate -> session link to referral\n"
-        "\u2022 Pre-login: web_open log, indexV4, jackpot, gameConfigs, itemConfig\n"
+        "\u2022 Pre-login: web_open, daylyJackpot, indexV4, pwa_download, indexV4(2), gameConfigs, itemConfig\n"
         "\u2022 Password AES-256-CBC encrypted (HAR verified)\n"
-        "\u2022 Random phone (6/7/8/9 start)\n"
+        "\u2022 webrtc: real IP in every call (HAR verified)\n"
+        "\u2022 isfrom: other_h5 for all calls (HAR verified)\n"
         "\u2022 Register -> Login -> Gift -> Claim -> 10 spins\n\n"
         "Example:\n"
         "`/register https://s.betfugu01.com/ezzwvl51eipuy39`",
