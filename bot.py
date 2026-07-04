@@ -10,9 +10,13 @@ Flow (all HAR-verified):
   1. Generate random Indian phone (starts 6/7/8/9, 10 digits)
   2. Register      : POST /user/register/account  (partner from redirect, itemuserfor=freespin)
   3. Login        : POST /user/login/account     (returns token)
-  4. Claim gift   : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
-  5. Subscribe    : POST /freetinygames/freespin/subscribe  (tyid=freespinbet10)
-  6. Play 10x     : POST /freetinygames/freespin/bet  (10 calls, until tycount=0)
+  4. Gift status  : GET  /opendata/homepage/registGifts  (check claimed=false)
+  5. Homepage    : POST /opendata/homepage/indexV4  (load config)
+  6. Free package: POST /user/profile/getfreepackage  (check package)
+  7. Claim gift   : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
+  8. Free package2: POST /user/profile/getfreepackage  (verify after claim)
+  9. Subscribe    : POST /freetinygames/freespin/subscribe  (tyid=freespinbet10)
+ 10. Play 10x    : POST /freetinygames/freespin/bet  (10 calls, until tycount=0)
 
 Env:
   BOT_TOKEN  — Telegram bot token from @BotFather
@@ -39,7 +43,11 @@ GAME_HOST = "https://game.betfuguapi.com"
 
 PATH_REGISTER = "/user/register/account"
 PATH_LOGIN = "/user/login/account"
+PATH_REGIST_GIFTS = "/opendata/homepage/registGifts"
+PATH_INDEX_V4 = "/opendata/homepage/indexV4"
+PATH_GET_FREEPACKAGE = "/user/profile/getfreepackage"
 PATH_CLAIM_GIFT = "/user/profile/claimRegistGifts"
+PATH_SET_LANGUAGE = "/user/profile/setlanguage"
 PATH_FREESPIN_SUBSCRIBE = "/freetinygames/freespin/subscribe"
 PATH_FREESPIN_BET = "/freetinygames/freespin/bet"
 
@@ -53,6 +61,8 @@ SUBSCRIBE_TYID = "freespinbet10"
 # HAR Entries 624-651: 10 bet calls, final tycount=0
 NUM_SPINS = 10
 FIXED_PASSWORD = "123456"
+# HAR Entry 298: setlanguage request body
+SET_LANGUAGE = "en-US"
 
 COMMON_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -104,23 +114,23 @@ def call_api(method, host, path, body=None, token=None, extra_params=None):
         return e.code, parsed
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent urllib from auto-following 302 redirects."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
 def follow_short_link_and_get_partner(short_url):
     """
-    Follow short refer link → 302 redirect → extract partner code.
-
+    Follow short refer link → 302 redirect → extract partner code and userId.
     HAR proof:
       Entry 3:  GET s.betfugu01.com/ezzwvl51eipuy39 → 302 (text/html, 123 bytes)
       Entry 8:  GET betfugu02.com/app/index.html?userId=2335316&cury=INR&partner=66666666&rtm=...
-
-    The 302 redirect Location header contains the full URL with partner=XXX.
-    We do NOT follow the redirect body — just read the Location header.
     """
     req = urllib.request.Request(short_url, headers=REDIRECT_HEADERS, method="GET")
-    # Use a handler that does NOT auto-follow redirects
     opener = urllib.request.build_opener(NoRedirectHandler())
     try:
         resp = opener.open(req, timeout=15)
-        # If somehow no redirect, check response URL
         final_url = resp.url
     except urllib.error.HTTPError as e:
         if e.code == 302:
@@ -131,7 +141,6 @@ def follow_short_link_and_get_partner(short_url):
     if not final_url:
         return None, None, "No redirect Location found"
 
-    # Parse partner and userId from redirect URL
     parsed = urlparse(final_url)
     params = parse_qs(parsed.query)
     partner = params.get("partner", [None])[0]
@@ -141,12 +150,6 @@ def follow_short_link_and_get_partner(short_url):
         return None, None, "Partner not found in redirect URL: {}".format(final_url)
 
     return partner, user_id, final_url
-
-
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Prevent urllib from auto-following 302 redirects."""
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
 def generate_random_phone():
@@ -193,12 +196,55 @@ def step_login(phone, password):
     return token, "Login ✅"
 
 
+def step_check_regist_gifts(token):
+    """HAR Entry 280 — GET /opendata/homepage/registGifts
+    Response: {"code":200,"data":{"claimed":false,"config":{"items":[{"id":"freespinbet10","num":10}]}}}
+    Must be called BEFORE claimRegistGifts — server expects this check first.
+    """
+    status, resp = call_api("GET", H5_HOST, PATH_REGIST_GIFTS, token=token)
+    if status != 200:
+        return False, "Gift status FAIL: HTTP {} {}".format(status, resp)
+    if resp.get("code") != 200:
+        return False, "Gift status FAIL: {}".format(resp)
+    data = resp.get("data", {})
+    claimed = data.get("claimed")
+    return True, "Gift status OK (claimed={})".format(claimed)
+
+
+def step_homepage_index_v4(token):
+    """HAR Entry 286 — POST /opendata/homepage/indexV4
+    Loads homepage config. No specific request body in HAR (empty or minimal).
+    Must be called before claim — server expects this sequence.
+    """
+    status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={}, token=token)
+    if status != 200:
+        return False, "Homepage FAIL: HTTP {} {}".format(status, resp)
+    if resp.get("code") != 200:
+        return False, "Homepage FAIL: {}".format(resp)
+    return True, "Homepage config OK ✅"
+
+
+def step_get_free_package(token):
+    """HAR Entry 283 — POST /user/profile/getfreepackage  (before claim)
+    Response before claim: {"code":200,"freePackage":{},"confs":{}}
+    Must be called before claim — server expects this.
+    """
+    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token)
+    if status != 200:
+        return False, "Free package FAIL: HTTP {} {}".format(status, resp)
+    if resp.get("code") != 200:
+        return False, "Free package FAIL: {}".format(resp)
+    return True, "Free package OK ✅ (before claim)"
+
+
 def step_claim_gift(token):
     """HAR Entry 288 — POST /user/profile/claimRegistGifts
     Response: {"code":200,"items":[{"id":"freespinbet10","num":10}]}
     """
     status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body={}, token=token)
-    if status != 200 or resp.get("code") != 200:
+    if status != 200:
+        return False, "Claim gift FAIL: HTTP {} {}".format(status, resp)
+    if resp.get("code") != 200:
         return False, "Claim gift FAIL: {}".format(resp)
     items = resp.get("items") or []
     found = any(i.get("id") == EXPECTED_GIFT_ID and i.get("num") == EXPECTED_GIFT_NUM
@@ -206,6 +252,35 @@ def step_claim_gift(token):
     if not found:
         return False, "Gift mismatch: {}".format(items)
     return True, "Gift claimed ✅ freespinbet10 x10"
+
+
+def step_get_free_package_after_claim(token):
+    """HAR Entry 293 — POST /user/profile/getfreepackage  (after claim)
+    Response after claim: {"code":200,"freePackage":{"freespinbet10":10},"confs":{...}}
+    Verifies the gift was successfully claimed.
+    """
+    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token)
+    if status != 200:
+        return False, "Free package (after) FAIL: HTTP {} {}".format(status, resp)
+    if resp.get("code") != 200:
+        return False, "Free package (after) FAIL: {}".format(resp)
+    free_pkg = resp.get("freePackage", {})
+    if EXPECTED_GIFT_ID in free_pkg:
+        return True, "Free package verified ✅ freespinbet10={}x".format(free_pkg[EXPECTED_GIFT_ID])
+    return True, "Free package after claim: {}".format(free_pkg)
+
+
+def step_set_language(token):
+    """HAR Entry 298 — POST /user/profile/setlanguage
+    Body: {"language":"en-US"}
+    """
+    body = {"language": SET_LANGUAGE}
+    status, resp = call_api("POST", H5_HOST, PATH_SET_LANGUAGE, body=body, token=token)
+    if status != 200:
+        return False, "Set language FAIL: HTTP {}".format(status)
+    if resp.get("code") != 200:
+        return False, "Set language FAIL: {}".format(resp)
+    return True, "Language set ✅ (en-US)"
 
 
 def step_freespin_subscribe(token):
@@ -279,20 +354,49 @@ def run_full_flow(refer_link):
     if not token:
         return False, "\n".join(report)
 
-    # Step 3 — Claim gift
+    # Step 3 — Check gift status (HAR Entry 280)
+    # MUST be called before claim — server expects this
+    ok, msg = step_check_regist_gifts(token)
+    report.append("3️⃣ Gift status: {}".format(msg))
+    if not ok:
+        return False, "\n".join(report)
+
+    # Step 4 — Homepage config (HAR Entry 286)
+    # MUST be called before claim — server expects this
+    ok, msg = step_homepage_index_v4(token)
+    report.append("4️⃣ Homepage: {}".format(msg))
+    if not ok:
+        return False, "\n".join(report)
+
+    # Step 5 — Free package check (HAR Entry 283 — before claim)
+    # MUST be called before claim — server expects this
+    ok, msg = step_get_free_package(token)
+    report.append("5️⃣ Free package (pre): {}".format(msg))
+    if not ok:
+        return False, "\n".join(report)
+
+    # Step 6 — Claim gift (HAR Entry 288)
     ok, msg = step_claim_gift(token)
-    report.append("3️⃣ Gift: {}".format(msg))
+    report.append("6️⃣ Claim gift: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Step 4 — Subscribe to free spin
+    # Step 7 — Free package check (HAR Entry 293 — after claim)
+    ok, msg = step_get_free_package_after_claim(token)
+    report.append("7️⃣ Free package (post): {}".format(msg))
+
+    # Step 8 — Set language (HAR Entry 298)
+    ok, msg = step_set_language(token)
+    report.append("8️⃣ Language: {}".format(msg))
+
+    # Step 9 — Subscribe to free spin (HAR Entry 618)
     ok, msg = step_freespin_subscribe(token)
-    report.append("4️⃣ Subscribe: {}".format(msg))
+    report.append("9️⃣ Subscribe: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Step 5 — Play 10 free spins
-    report.append("5️⃣ Playing 10 free spins...")
+    # Step 10 — Play 10 free spins (HAR Entries 624-651)
+    report.append("🔟 Playing 10 free spins...")
     ok, spin_report = step_play_spins(token)
     report.append(spin_report)
     report.append("")
@@ -355,16 +459,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Short refer link follow → 302 redirect → partner code extract\n"
         "• Random 10-digit phone (6/7/8/9 se start)\n"
         "• Password: 123456\n"
-        "• Register → Login → Claim gift → Subscribe → 10 spins khelta hai\n\n"
+        "• Register → Login → Gift check → Homepage → Free pkg → Claim → Play 10 spins\n\n"
         "Example:\n"
         "`/register https://s.betfugu01.com/ezzwvl51eipuy39`\n\n"
-        "Verified from HAR:\n"
-        "• Short link → 302 → partner (Entry 3→8)\n"
-        "• Register: POST /user/register/account (Entry 271)\n"
-        "• Login: POST /user/login/account (Entry 274)\n"
-        "• Gift: POST /user/profile/claimRegistGifts (Entry 288)\n"
-        "• Subscribe: POST /freetinygames/freespin/subscribe (Entry 618)\n"
-        "• Bet: POST /freetinygames/freespin/bet x10 (Entries 624-651)",
+        "Verified from HAR (10 steps):\n"
+        "0. Short link → 302 → partner (Entry 3→8)\n"
+        "1. Register: POST /user/register/account (Entry 271)\n"
+        "2. Login: POST /user/login/account (Entry 274)\n"
+        "3. Gift check: GET /opendata/homepage/registGifts (Entry 280)\n"
+        "4. Homepage: POST /opendata/homepage/indexV4 (Entry 286)\n"
+        "5. Free pkg: POST /user/profile/getfreepackage (Entry 283)\n"
+        "6. Claim: POST /user/profile/claimRegistGifts (Entry 288)\n"
+        "7. Free pkg: POST /user/profile/getfreepackage (Entry 293)\n"
+        "8. Language: POST /user/profile/setlanguage (Entry 298)\n"
+        "9. Subscribe: POST /freetinygames/freespin/subscribe (Entry 618)\n"
+        "10. Bet x10: POST /freetinygames/freespin/bet (Entries 624-651)",
         parse_mode="Markdown",
     )
 
