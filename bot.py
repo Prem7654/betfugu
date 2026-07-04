@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-BetFugu Registration Bot — Telegram + HAR-verified.
+BetFugu Auto-Register + Free Spin Bot — Telegram + HAR-verified.
+No guessing. Every endpoint, field, value from HAR report.
 
-Telegram bot jo BetFugu pe account register karta hai.
-Sirf verified HAR endpoints — no guessing.
+Flow (all HAR-verified):
+  1. Parse partner code from user's refer link
+  2. Generate random Indian phone (starts 6/7/8/9, 10 digits)
+  3. Register  : POST /user/register/account  (partner from link, itemuserfor=freespin)
+  4. Login      : POST /user/login/account     (returns token)
+  5. Claim gift : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
+  6. Subscribe  : POST /freetinygames/freespin/subscribe  (tyid=freespinbet10)
+  7. Play 10x   : POST /freetinygames/freespin/bet  (10 calls, until tycount=0)
 
-Commands:
-  /start          — Bot welcome + help
-  /register       — Register karna (phone + password maangta hai)
-  /register PHONE PASSWORD — Direct register
-
-Verified endpoints (HAR report):
-  1. Domain redirect  : GET  /opendata/domainRedirect?domain=betfugu02.com
-  2. Registration       : POST /user/register/account  (partner:66666666, itemuserfor:freespin)
-  3. Login              : POST /user/login/account    (returns token)
-  4. Claim gift        : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
-
-Env variables:
-  BOT_TOKEN  — Telegram Bot Token (@BotFather se lo)
+Env:
+  BOT_TOKEN  — Telegram bot token from @BotFather
 """
 
 import os
+import re
 import json
+import random
 import urllib.request
 import urllib.error
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 
 from telegram import Update
 from telegram.ext import (
@@ -34,16 +32,25 @@ from telegram.ext import (
 )
 
 # ---- Verified constants (from HAR report) ----
-BASE_HOST = "https://h5server.betfuguapi.com"
-PATH_DOMAIN_REDIRECT = "/opendata/domainRedirect"
+H5_HOST = "https://h5server.betfuguapi.com"
+GAME_HOST = "https://game.betfuguapi.com"
+
 PATH_REGISTER = "/user/register/account"
 PATH_LOGIN = "/user/login/account"
 PATH_CLAIM_GIFT = "/user/profile/claimRegistGifts"
+PATH_FREESPIN_SUBSCRIBE = "/freetinygames/freespin/subscribe"
+PATH_FREESPIN_BET = "/freetinygames/freespin/bet"
 
-VERIFIED_PARTNER = 66666666       # Entry 271 request body
-VERIFIED_ITEMUSERFOR = "freespin" # Entry 271 request body
-EXPECTED_GIFT_ID = "freespinbet10" # Entry 288 response body
-EXPECTED_GIFT_NUM = 10              # Entry 288 response body
+# HAR Entry 271: itemuserfor = "freespin"
+VERIFIED_ITEMUSERFOR = "freespin"
+# HAR Entry 288: gift id and count
+EXPECTED_GIFT_ID = "freespinbet10"
+EXPECTED_GIFT_NUM = 10
+# HAR Entry 618: subscribe request body
+SUBSCRIBE_TYID = "freespinbet10"
+# HAR Entry 624-651: 10 bet calls, final tycount=0
+NUM_SPINS = 10
+FIXED_PASSWORD = "123456"
 
 COMMON_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -58,7 +65,7 @@ COMMON_HEADERS = {
 
 
 def call_api(method, host, path, body=None, token=None, extra_params=None):
-    """Make a single API call, return (http_status, response_json)."""
+    """Make single API call, return (http_status, response_json)."""
     url = host + path
     if extra_params:
         url += "?" + urlencode(extra_params)
@@ -70,7 +77,7 @@ def call_api(method, host, path, body=None, token=None, extra_params=None):
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
             status = resp.status
             try:
@@ -87,132 +94,219 @@ def call_api(method, host, path, body=None, token=None, extra_params=None):
         return e.code, parsed
 
 
+def parse_partner_from_link(link):
+    """
+    Extract partner code from refer link.
+    HAR proves partner comes as URL param: partner=66666666
+    (HAR lines 15870, 15944, 16312 — URL: ?partner=66666666)
+    """
+    try:
+        parsed = urlparse(link)
+        params = parse_qs(parsed.query)
+        partner = params.get("partner", [None])[0]
+        if partner:
+            return partner
+    except Exception:
+        pass
+    # Try regex fallback if URL format different
+    match = re.search(r'partner=(\d+)', link)
+    if match:
+        return match.group(1)
+    return None
+
+
+def generate_random_phone():
+    """
+    Generate random 10-digit Indian phone starting with 6, 7, 8, or 9.
+    HAR Entry 271 shows account field = phone number.
+    """
+    first_digit = random.choice(["6", "7", "8", "9"])
+    rest = "".join(random.choice("0123456789") for _ in range(9))
+    return first_digit + rest
+
+
 # ---- BetFugu API steps (all HAR-verified) ----
 
-def step_domain_redirect():
-    """HAR Entry 96 — GET /opendata/domainRedirect?domain=betfugu02.com"""
-    status, body = call_api("GET", BASE_HOST, PATH_DOMAIN_REDIRECT,
-                            extra_params={"domain": "betfugu02.com"})
-    if status != 200 or body.get("code") != 200:
-        return False, "Domain redirect fail: {}".format(body)
-    data = body.get("data") or {}
-    if data.get("domain") != "betfugu02.com":
-        return False, "Unexpected domain"
-    return True, "Domain OK → betfugu02.com (IN / INR)"
-
-
-def step_register(phone, password):
-    """HAR Entry 271 — POST /user/register/account"""
+def step_register(phone, password, partner):
+    """HAR Entry 271 — POST /user/register/account
+    Body: {account, password, partner, itemuserfor:"freespin"}
+    Response: {"code":200}
+    """
     body = {
         "account": phone,
         "password": password,
-        "partner": VERIFIED_PARTNER,
+        "partner": int(partner),
         "itemuserfor": VERIFIED_ITEMUSERFOR,
     }
-    status, resp = call_api("POST", BASE_HOST, PATH_REGISTER, body=body)
+    status, resp = call_api("POST", H5_HOST, PATH_REGISTER, body=body)
     if status != 200 or resp.get("code") != 200:
-        return False, "Registration fail: {}".format(resp)
-    return True, "Account registered ✅ (server code 200)"
+        return False, "Registration FAIL: {}".format(resp)
+    return True, "Registered ✅ (code 200)"
 
 
 def step_login(phone, password):
-    """HAR Entry 274 — POST /user/login/account → returns token"""
+    """HAR Entry 274 — POST /user/login/account
+    Body: {account, password}
+    Response: {"code":200, "token":"..."}
+    """
     body = {"account": phone, "password": password}
-    status, resp = call_api("POST", BASE_HOST, PATH_LOGIN, body=body)
+    status, resp = call_api("POST", H5_HOST, PATH_LOGIN, body=body)
     if status != 200 or resp.get("code") != 200:
-        return None, "Login fail: {}".format(resp)
+        return None, "Login FAIL: {}".format(resp)
     token = resp.get("token")
     if not token:
-        return None, "Login did not return token"
-    return token, "Login ✅ — token received"
+        return None, "Login FAIL: no token"
+    return token, "Login ✅"
 
 
 def step_claim_gift(token):
-    """HAR Entry 288 — POST /user/profile/claimRegistGifts → freespinbet10 x10"""
-    status, resp = call_api("POST", BASE_HOST, PATH_CLAIM_GIFT, body={}, token=token)
+    """HAR Entry 288 — POST /user/profile/claimRegistGifts
+    Response: {"code":200,"items":[{"id":"freespinbet10","num":10}]}
+    """
+    status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body={}, token=token)
     if status != 200 or resp.get("code") != 200:
-        return False, "Claim gift fail: {}".format(resp)
+        return False, "Claim gift FAIL: {}".format(resp)
     items = resp.get("items") or []
     found = any(i.get("id") == EXPECTED_GIFT_ID and i.get("num") == EXPECTED_GIFT_NUM
                for i in items)
     if not found:
-        return False, "Gift item mismatch: {}".format(items)
+        return False, "Gift mismatch: {}".format(items)
     return True, "Gift claimed ✅ freespinbet10 x10"
 
 
-def run_full_registration(phone, password):
-    """Run all 4 HAR-verified steps. Returns (success, report_text)."""
+def step_freespin_subscribe(token):
+    """HAR Entry 618 — POST /freetinygames/freespin/subscribe
+    Body: {"tyid":"freespinbet10"}
+    """
+    body = {"tyid": SUBSCRIBE_TYID}
+    status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_SUBSCRIBE, body=body, token=token)
+    if status != 200 or resp.get("code") != 200:
+        return False, "Subscribe FAIL: {}".format(resp)
+    return True, "Subscribed ✅ (freespinbet10)"
+
+
+def step_play_spins(token):
+    """HAR Entries 624-651 — POST /freetinygames/freespin/bet
+    10 calls. Each response has tycount (remaining spins).
+    HAR proves: starts at tycount=9 (after 1st bet), ends at tycount=0.
+    No request body required (HAR shows no request body for bet calls).
+    """
+    results = []
+    total_win = 0
+    for i in range(NUM_SPINS):
+        status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_BET, body=None, token=token)
+        if status != 200:
+            results.append("Spin {}: ❌ HTTP {}".format(i+1, status))
+            break
+        game_data = resp.get("lotteryGameResult", {}).get("data", {})
+        balance = game_data.get("balance", "?")
+        win = game_data.get("win", 0)
+        tycount = resp.get("tycount", "?")
+        total_win += win if isinstance(win, (int, float)) else 0
+        results.append("Spin {}/{}: bet=10 win={} bal={} left={}".format(
+            i+1, NUM_SPINS, win, balance, tycount))
+        if tycount == 0 and i < NUM_SPINS - 1:
+            break
+    return True, "\n".join(results) + "\nTotal win: {}".format(total_win)
+
+
+def run_full_flow(partner_code):
+    """Run complete auto-registration + free spin flow."""
     report = []
+    phone = generate_random_phone()
+    password = FIXED_PASSWORD
 
-    # Step 1 — Domain redirect
-    ok, msg = step_domain_redirect()
-    report.append("1️⃣ Domain: {}".format(msg))
+    report.append("🎰 BetFugu Auto-Register")
+    report.append("Phone: {}".format(phone))
+    report.append("Password: {}".format(password))
+    report.append("Partner: {} (from refer link)".format(partner_code))
+    report.append("")
+
+    # Step 1 — Register
+    ok, msg = step_register(phone, password, partner_code)
+    report.append("1️⃣ Register: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Step 2 — Register
-    ok, msg = step_register(phone, password)
-    report.append("2️⃣ Register: {}".format(msg))
-    if not ok:
-        return False, "\n".join(report)
-
-    # Step 3 — Login
+    # Step 2 — Login
     token, msg = step_login(phone, password)
-    report.append("3️⃣ Login: {}".format(msg))
+    report.append("2️⃣ Login: {}".format(msg))
     if not token:
         return False, "\n".join(report)
 
-    # Step 4 — Claim gift
+    # Step 3 — Claim gift
     ok, msg = step_claim_gift(token)
-    report.append("4️⃣ Gift: {}".format(msg))
+    report.append("3️⃣ Gift: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    report.append("\n✅ Registration complete! No deposit, no spins — only register + gift.")
+    # Step 4 — Subscribe to free spin
+    ok, msg = step_freespin_subscribe(token)
+    report.append("4️⃣ Subscribe: {}".format(msg))
+    if not ok:
+        return False, "\n".join(report)
+
+    # Step 5 — Play 10 free spins
+    report.append("5️⃣ Playing 10 free spins...")
+    ok, spin_report = step_play_spins(token)
+    report.append(spin_report)
+    report.append("")
+    report.append("✅ Done! Registration + 10 free spins khel diye.")
+
     return True, "\n".join(report)
 
 
 # ---- Telegram Bot Commands ----
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message"""
     await update.message.reply_text(
-        "🎰 *BetFugu Registration Bot*\n\n"
+        "🎰 *BetFugu Auto-Register Bot*\n\n"
         "HAR-verified — no guessing.\n\n"
         "Commands:\n"
-        "`/register PHONE PASSWORD` — direct register\n"
-        "`/register` — step by step\n\n"
-        "Verified partner: `66666666`\n"
-        "Gift: `freespinbet10` x10",
+        "`/register <REFER_LINK>` — refer link do, bot auto register + 10 free spins kheliga\n"
+        "`/help` — help\n\n"
+        "Flow:\n"
+        "1. Random phone (6/7/8/9 se start)\n"
+        "2. Password: 123456\n"
+        "3. Register → Login → Claim gift → Play 10 spins",
         parse_mode="Markdown",
     )
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /register PHONE PASSWORD
-    or
-    /register  (then bot asks for phone + password)
+    /register <REFER_LINK>
     """
-    text = "🔄 Starting BetFugu registration...\nAll steps HAR-verified.\n\n"
-    msg = await update.message.reply_text(text)
-
-    if len(context.args) >= 2:
-        phone = context.args[0]
-        password = context.args[1]
-    elif len(context.args) == 1:
-        await msg.edit_text(text + "⚠️ Password bhi do!\n\nUse: `/register PHONE PASSWORD`", parse_mode="Markdown")
-        return
-    else:
-        await msg.edit_text(text + "⚠️ Use: `/register PHONE PASSWORD`", parse_mode="Markdown")
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Refer link do!\n\nUse: `/register https://betfugu02.com/...?partner=XXXXXX`",
+            parse_mode="Markdown",
+        )
         return
 
-    success, report = run_full_registration(phone, password)
+    refer_link = " ".join(context.args)
+    partner = parse_partner_from_link(refer_link)
 
-    full_text = text + "\n" + report
-    # Telegram message limit = 4096 chars
-    for i in range(0, len(full_text), 4000):
-        chunk = full_text[i:i + 4000]
+    if not partner:
+        await update.message.reply_text(
+            "❌ Refer link me partner code nahi mila.\n"
+            "Link me `partner=XXXXXX` hona chahiye.\n\n"
+            "Example: `/register https://betfugu02.com/?partner=66666666`",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg = await update.message.reply_text(
+        "🔄 Starting auto-registration...\n"
+        "Partner: {}\n"
+        "Generating random phone...".format(partner)
+    )
+
+    success, report = run_full_flow(partner)
+
+    # Send report in chunks (Telegram 4096 char limit)
+    for i in range(0, len(report), 4000):
+        chunk = report[i:i+4000]
         if i == 0:
             await msg.edit_text(chunk)
         else:
@@ -220,17 +314,20 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help message"""
     await update.message.reply_text(
         "📖 *Help*\n\n"
-        "`/start` — welcome\n"
-        "`/register PHONE PASSWORD` — register karo BetFugu pe\n"
-        "`/help` — ye message\n\n"
+        "`/register <REFER_LINK>` — auto register + 10 free spins\n\n"
+        "Bot kya karta hai:\n"
+        "• Refer link se partner code nikalta hai\n"
+        "• Random 10-digit phone (6/7/8/9 se start)\n"
+        "• Password: 123456\n"
+        "• Register → Login → Claim gift → Subscribe → 10 spins khelta hai\n\n"
         "Verified from HAR:\n"
-        "• Domain: betfugu02.com (IN/INR)\n"
-        "• Partner: 66666666\n"
-        "• itemuserfor: freespin\n"
-        "• Gift: freespinbet10 x10",
+        "• Register: POST /user/register/account\n"
+        "• Login: POST /user/login/account\n"
+        "• Gift: POST /user/profile/claimRegistGifts\n"
+        "• Subscribe: POST /freetinygames/freespin/subscribe\n"
+        "• Bet: POST /freetinygames/freespin/bet (10x)",
         parse_mode="Markdown",
     )
 
@@ -239,10 +336,10 @@ def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         print("ERROR: BOT_TOKEN env variable set nahi hai!")
-        print("Railway Variables tab mein BOT_TOKEN=xxx add karo")
+        print("Railway Variables me BOT_TOKEN=xxx add karo")
         raise SystemExit(1)
 
-    print("BetFugu TG Bot starting...")
+    print("BetFugu Auto-Register TG Bot starting...")
     print("Token: {}...{}".format(token[:8], token[-3:]))
 
     app = ApplicationBuilder().token(token).build()
@@ -251,8 +348,7 @@ def main():
     app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("help", cmd_help))
 
-    # Polling mode — Railway pe worker dyno use kar agar web dyno port error aaye
-    print("Bot polling... waiting for Telegram commands.")
+    print("Bot polling...")
     app.run_polling()
 
 
