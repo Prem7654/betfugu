@@ -1,36 +1,48 @@
-# BetFugu Registration Bot
+# BetFugu Registration Telegram Bot
 
-HAR-verified registration-only bot for BetFugu. No guessing — every endpoint, field, and value comes from the HAR report.
+HAR-verified registration bot for BetFugu — Telegram se chalta hai.
+No guessing — every endpoint, field, value HAR report se verified.
 
-## What it does
+## Commands
 
-1. **Domain redirect** — `GET /opendata/domainRedirect` (Entry 96)
-2. **Registration** — `POST /user/register/account` with partner `66666666`, itemuserfor `freespin` (Entry 271)
-3. **Login** — `POST /user/login/account` → returns auth token (Entry 274)
-4. **Claim registration gift** — `POST /user/profile/claimRegistGifts` → `freespinbet10` x10 (Entry 288)
+| Command | Kaam |
+|---|---|
+| `/start` | Welcome + help |
+| `/register PHONE PASSWORD` | BetFugu pe account register + gift claim |
+| `/help` | Full help
 
-No deposit, no spins, no payment — registration + gift claim only.
+## Verified flow (HAR evidence)
+
+| Step | Endpoint | HAR Entry | Result |
+|---|---|---|---|
+| 1 | `GET /opendata/domainRedirect?domain=betfugu02.com` | 96 | domain `betfugu02.com`, IN/INR |
+| 2 | `POST /user/register/account` | 271 | partner `66666666`, itemuserfor `freespin` → code 200 |
+| 3 | `POST /user/login/account` | 274 | returns auth token |
+| 4 | `POST /user/profile/claimRegistGifts` | 288 | `freespinbet10` x10 |
+
+## Env variables (Railway Variables tab)
+
+```
+BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi
+```
+
+`BOT_TOKEN` — @BotFather se lo Telegram pe.
+
+## Deploy on Railway
+
+1. Railway pe repo connect karo
+2. Variables → `BOT_TOKEN` add karo
+3. Railway automatically `Procfile` se `python3 bot.py` run karega
+4. Telegram pe apne bot ko `/register PHONE PASSWORD` bhejo
 
 ## Run locally
 
 ```bash
-python3 bot.py --phone 91xxxxxxxxxx --password YourPass123
+export BOT_TOKEN=your_telegram_token
+python3 bot.py
 ```
 
-## Deploy on Railway
+## Requirements
 
-1. Fork / connect this repo to Railway
-2. Add Variables:
-   - `PHONE` — your phone number
-   - `PASSWORD` — your password
-3. Railway will run the Procfile command automatically
-
-## Verified facts (from HAR)
-
-| Fact | Value | HAR Entry |
-|---|---|---|
-| Partner code | `66666666` | 271 |
-| itemuserfor | `freespin` | 271 |
-| Gift ID | `freespinbet10` | 288 |
-| Gift count | `10` | 288 |
-| Domain | `betfugu02.com` (IN / INR) | 96 |
+- Python 3.11+
+- `python-telegram-bot==21.6`

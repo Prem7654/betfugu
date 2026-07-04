@@ -1,44 +1,39 @@
 #!/usr/bin/env python3
 """
-BetFugu registration-only bot.
+BetFugu Registration Bot — Telegram + HAR-verified.
 
-IMPORTANT: This bot is built strictly from verified HAR evidence.
-No guessing. Every endpoint, field name, and value comes from the HAR
-report (betfugu_har_full_report.md) that you uploaded.
+Telegram bot jo BetFugu pe account register karta hai.
+Sirf verified HAR endpoints — no guessing.
 
-Verified endpoints (from the HAR report):
-  1. Domain redirect    : GET  https://h5server.betfuguapi.com/opendata/domainRedirect
-  2. Registration       : POST https://h5server.betfuguapi.com/user/register/account
-  3. Login              : POST https://h5server.betfuguapi.com/user/login/account
-  4. Claim registration gift: POST https://h5server.betfuguapi.com/user/profile/claimRegistGifts
+Commands:
+  /start          — Bot welcome + help
+  /register       — Register karna (phone + password maangta hai)
+  /register PHONE PASSWORD — Direct register
 
-Verified request fields (sanitized in the report):
-  - Registration body fields: account, password, partner, itemuserfor
-  - Partner code           : 66666666
-  - itemuserfor            : "freespin"
-  - Login body fields      : account, password
-  - Login returns          : {"code":200, "token": "..."}
-  - Claim gift returns     : {"code":200, "items":[{"id":"freespinbet10","num":10}]}
+Verified endpoints (HAR report):
+  1. Domain redirect  : GET  /opendata/domainRedirect?domain=betfugu02.com
+  2. Registration       : POST /user/register/account  (partner:66666666, itemuserfor:freespin)
+  3. Login              : POST /user/login/account    (returns token)
+  4. Claim gift        : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
 
-Usage:
-  python3 betfugu_reg_bot.py --phone 9xxxxxxxxxx --password YourPass123
-
-The bot will:
-  1) GET domainRedirect
-  2) POST register/account
-  3) POST login/account
-  4) POST claimRegistGifts
-
-Each step is printed with proof (HTTP status + response code).
-No payment, no spin, no deposit — registration only.
+Env variables:
+  BOT_TOKEN  — Telegram Bot Token (@BotFather se lo)
 """
 
-import argparse, json, sys
-
+import os
+import json
 import urllib.request
 import urllib.error
+from urllib.parse import urlencode
 
-# ---- Verified constants (from the HAR report) ----
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
+
+# ---- Verified constants (from HAR report) ----
 BASE_HOST = "https://h5server.betfuguapi.com"
 PATH_DOMAIN_REDIRECT = "/opendata/domainRedirect"
 PATH_REGISTER = "/user/register/account"
@@ -66,7 +61,6 @@ def call_api(method, host, path, body=None, token=None, extra_params=None):
     """Make a single API call, return (http_status, response_json)."""
     url = host + path
     if extra_params:
-        from urllib.parse import urlencode
         url += "?" + urlencode(extra_params)
 
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -93,144 +87,173 @@ def call_api(method, host, path, body=None, token=None, extra_params=None):
         return e.code, parsed
 
 
+# ---- BetFugu API steps (all HAR-verified) ----
+
 def step_domain_redirect():
-    """Verified: Entry 96 — GET /opendata/domainRedirect?domain=betfugu02.com.
-    Response: {"code":200,"data":{"domain":"betfugu02.com","country":"IN","currency":"INR"}}
-    """
-    print("\n[Step 1/4] Domain redirect")
-    print("  Endpoint : {}{}".format(BASE_HOST, PATH_DOMAIN_REDIRECT))
-    print("  Evidence : HAR Entry 96, status 200")
-    status, body = call_api("GET", BASE_HOST, PATH_DOMAIN_REDIRECT, extra_params={"domain": "betfugu02.com"})
-    print("  HTTP {}".format(status))
-    print("  Response : {}".format(json.dumps(body, ensure_ascii=False)))
-    code = body.get("code")
-    if status != 200 or code != 200:
-        return _fail("Domain redirect expected HTTP 200 + code 200")
+    """HAR Entry 96 — GET /opendata/domainRedirect?domain=betfugu02.com"""
+    status, body = call_api("GET", BASE_HOST, PATH_DOMAIN_REDIRECT,
+                            extra_params={"domain": "betfugu02.com"})
+    if status != 200 or body.get("code") != 200:
+        return False, "Domain redirect fail: {}".format(body)
     data = body.get("data") or {}
     if data.get("domain") != "betfugu02.com":
-        return _fail("Unexpected domain in redirect response")
-    print_ok("Domain verified -> betfugu02.com (IN / INR)")
-    return True
+        return False, "Unexpected domain"
+    return True, "Domain OK → betfugu02.com (IN / INR)"
 
 
 def step_register(phone, password):
-    """Verified: Entry 271 — POST /user/register/account.
-    Request body (sanitized): {account, password, partner:66666666, itemuserfor:"freespin"}
-    Response: {"code":200}
-    """
-    print("\n[Step 2/4] Registration")
-    print("  Endpoint : {}{}".format(BASE_HOST, PATH_REGISTER))
-    print("  Evidence : HAR Entry 271, status 200, response {\"code\":200}")
+    """HAR Entry 271 — POST /user/register/account"""
     body = {
         "account": phone,
         "password": password,
         "partner": VERIFIED_PARTNER,
         "itemuserfor": VERIFIED_ITEMUSERFOR,
     }
-    print("  Partner   : {}  (verified from HAR)".format(VERIFIED_PARTNER))
-    print("  itemuserfor: {}  (verified from HAR)".format(VERIFIED_ITEMUSERFOR))
     status, resp = call_api("POST", BASE_HOST, PATH_REGISTER, body=body)
-    print("  HTTP {}".format(status))
-    print("  Response : {}".format(json.dumps(resp, ensure_ascii=False)))
-    if status != 200:
-        return _fail("Registration HTTP failed")
-    if resp.get("code") != 200:
-        return _fail("Registration response code is not 200")
-    print_ok("Account registered (server returned code 200)")
-    return True
+    if status != 200 or resp.get("code") != 200:
+        return False, "Registration fail: {}".format(resp)
+    return True, "Account registered ✅ (server code 200)"
 
 
 def step_login(phone, password):
-    """Verified: Entry 274 — POST /user/login/account.
-    Request body: {account, password}
-    Response: {"code":200, "token": "..."}
-    """
-    print("\n[Step 3/4] Login")
-    print("  Endpoint : {}{}".format(BASE_HOST, PATH_LOGIN))
-    print("  Evidence : HAR Entry 274, status 200, returns {\"code\":200,\"token\":\"...\"}")
+    """HAR Entry 274 — POST /user/login/account → returns token"""
     body = {"account": phone, "password": password}
     status, resp = call_api("POST", BASE_HOST, PATH_LOGIN, body=body)
-    print("  HTTP {}".format(status))
-    token = resp.get("token")
-    if token:
-        # Don't print full token — same as sanitizer in the report.
-        print("  Token    : {}...{}".format(token[:6], token[-3:]))
-    else:
-        print("  Response : {}".format(json.dumps(resp, ensure_ascii=False)))
     if status != 200 or resp.get("code") != 200:
-        return _fail("Login failed")
+        return None, "Login fail: {}".format(resp)
+    token = resp.get("token")
     if not token:
-        return _fail("Login did not return a token")
-    print_ok("Login success — auth token received (redacted)")
-    return token
+        return None, "Login did not return token"
+    return token, "Login ✅ — token received"
 
 
 def step_claim_gift(token):
-    """Verified: Entry 288 — POST /user/profile/claimRegistGifts.
-    Response: {"code":200,"items":[{"id":"freespinbet10","num":10}]}
-    """
-    print("\n[Step 4/4] Claim registration gift")
-    print("  Endpoint : {}{}".format(BASE_HOST, PATH_CLAIM_GIFT))
-    print("  Evidence : HAR Entry 288, status 200, items=[freespinbet10 x10]")
+    """HAR Entry 288 — POST /user/profile/claimRegistGifts → freespinbet10 x10"""
     status, resp = call_api("POST", BASE_HOST, PATH_CLAIM_GIFT, body={}, token=token)
-    print("  HTTP {}".format(status))
-    print("  Response : {}".format(json.dumps(resp, ensure_ascii=False)))
     if status != 200 or resp.get("code") != 200:
-        return _fail("Claim gift failed")
+        return False, "Claim gift fail: {}".format(resp)
     items = resp.get("items") or []
-    found = any(i.get("id") == EXPECTED_GIFT_ID and i.get("num") == EXPECTED_GIFT_NUM for i in items)
+    found = any(i.get("id") == EXPECTED_GIFT_ID and i.get("num") == EXPECTED_GIFT_NUM
+               for i in items)
     if not found:
-        return _fail("Expected gift item freespinbet10 x10 not present")
-    print_ok("Gift claimed: freespinbet10 x10 (verified match)")
-    return True
+        return False, "Gift item mismatch: {}".format(items)
+    return True, "Gift claimed ✅ freespinbet10 x10"
 
 
-def _fail(msg):
-    print("  [FAIL] " + msg)
-    return False
+def run_full_registration(phone, password):
+    """Run all 4 HAR-verified steps. Returns (success, report_text)."""
+    report = []
+
+    # Step 1 — Domain redirect
+    ok, msg = step_domain_redirect()
+    report.append("1️⃣ Domain: {}".format(msg))
+    if not ok:
+        return False, "\n".join(report)
+
+    # Step 2 — Register
+    ok, msg = step_register(phone, password)
+    report.append("2️⃣ Register: {}".format(msg))
+    if not ok:
+        return False, "\n".join(report)
+
+    # Step 3 — Login
+    token, msg = step_login(phone, password)
+    report.append("3️⃣ Login: {}".format(msg))
+    if not token:
+        return False, "\n".join(report)
+
+    # Step 4 — Claim gift
+    ok, msg = step_claim_gift(token)
+    report.append("4️⃣ Gift: {}".format(msg))
+    if not ok:
+        return False, "\n".join(report)
+
+    report.append("\n✅ Registration complete! No deposit, no spins — only register + gift.")
+    return True, "\n".join(report)
 
 
-def print_ok(msg):
-    print("  [OK] " + msg)
+# ---- Telegram Bot Commands ----
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome message"""
+    await update.message.reply_text(
+        "🎰 *BetFugu Registration Bot*\n\n"
+        "HAR-verified — no guessing.\n\n"
+        "Commands:\n"
+        "`/register PHONE PASSWORD` — direct register\n"
+        "`/register` — step by step\n\n"
+        "Verified partner: `66666666`\n"
+        "Gift: `freespinbet10` x10",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /register PHONE PASSWORD
+    or
+    /register  (then bot asks for phone + password)
+    """
+    text = "🔄 Starting BetFugu registration...\nAll steps HAR-verified.\n\n"
+    msg = await update.message.reply_text(text)
+
+    if len(context.args) >= 2:
+        phone = context.args[0]
+        password = context.args[1]
+    elif len(context.args) == 1:
+        await msg.edit_text(text + "⚠️ Password bhi do!\n\nUse: `/register PHONE PASSWORD`", parse_mode="Markdown")
+        return
+    else:
+        await msg.edit_text(text + "⚠️ Use: `/register PHONE PASSWORD`", parse_mode="Markdown")
+        return
+
+    success, report = run_full_registration(phone, password)
+
+    full_text = text + "\n" + report
+    # Telegram message limit = 4096 chars
+    for i in range(0, len(full_text), 4000):
+        chunk = full_text[i:i + 4000]
+        if i == 0:
+            await msg.edit_text(chunk)
+        else:
+            await update.message.reply_text(chunk)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help message"""
+    await update.message.reply_text(
+        "📖 *Help*\n\n"
+        "`/start` — welcome\n"
+        "`/register PHONE PASSWORD` — register karo BetFugu pe\n"
+        "`/help` — ye message\n\n"
+        "Verified from HAR:\n"
+        "• Domain: betfugu02.com (IN/INR)\n"
+        "• Partner: 66666666\n"
+        "• itemuserfor: freespin\n"
+        "• Gift: freespinbet10 x10",
+        parse_mode="Markdown",
+    )
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="BetFugu registration-only bot (no guessing, HAR-verified)"
-    )
-    p.add_argument("--phone", required=True, help="Account / phone number to register")
-    p.add_argument("--password", required=True, help="Password for the account")
-    args = p.parse_args()
-
-    print("=" * 64)
-    print("BetFugu Registration Bot — HAR-verified, registration only")
-    print("=" * 64)
-    print("Phone        : {}".format(args.phone))
-    print("Partner code : {}  (verified: HAR Entry 271)".format(VERIFIED_PARTNER))
-    print("itemuserfor    : {}  (verified: HAR Entry 271)".format(VERIFIED_ITEMUSERFOR))
-    print("Expected gift : {} x{}  (verified: HAR Entry 288)".format(EXPECTED_GIFT_ID, EXPECTED_GIFT_NUM))
-
-    # Step 1 — domain redirect (verified)
-    if not step_domain_redirect():
-        sys.exit(1)
-
-    # Step 2 — registration (verified)
-    if not step_register(args.phone, args.password):
-        sys.exit(1)
-
-    # Step 3 — login (verified)
-    token = step_login(args.phone, args.password)
+    token = os.environ.get("BOT_TOKEN")
     if not token:
-        sys.exit(1)
+        print("ERROR: BOT_TOKEN env variable set nahi hai!")
+        print("Railway Variables tab mein BOT_TOKEN=xxx add karo")
+        raise SystemExit(1)
 
-    # Step 4 — claim registration gift (verified)
-    if not step_claim_gift(token):
-        sys.exit(1)
+    print("BetFugu TG Bot starting...")
+    print("Token: {}...{}".format(token[:8], token[-3:]))
 
-    print("\n" + "=" * 64)
-    print("Registration flow complete. Nothing else was attempted.")
-    print("No deposit, no spins, no payment — registration + gift claim only.")
-    print("=" * 64)
+    app = ApplicationBuilder().token(token).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("register", cmd_register))
+    app.add_handler(CommandHandler("help", cmd_help))
+
+    # Polling mode — Railway pe worker dyno use kar agar web dyno port error aaye
+    print("Bot polling... waiting for Telegram commands.")
+    app.run_polling()
 
 
 if __name__ == "__main__":
