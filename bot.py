@@ -7,25 +7,31 @@ KEY FIXES:
 1. Server uses `access-token` custom header (NOT `Authorization: Bearer`).
 2. All 20+ custom headers from HAR included.
 3. Body is always `{}` for POST calls (HAR: bodySize=2, text='{}').
-4. REFERRAL FIX: Pre-login indexV4 call with `sourceurl` containing
-   userId, cury, partner, rtm — server tracks referral from this.
-   (HAR Entry 131: sourceurl has userId=2335316 before register)
-   Without this, refer bonus is NOT credited.
+4. REFERRAL FIX: Pre-login indexV4 with userId in sourceurl.
+5. PASSWORD FIX: Password is AES-CBC encrypted before sending.
+   HAR proves: plain "123456" -> AES encrypt -> "h1glmyQ2dTe2r+ARoXsgbQ=="
+   Without encryption, register works but referral bonus is NOT credited.
+
+AES encryption (from JS source, HAR-verified):
+  1. Decrypt pureKey using key/iv to get encryptKey:encryptIv
+     key = "3dfe30508ab4a03043f014a6684034ff" (32 bytes UTF-8)
+     iv  = "fe3480b3543dytj3" (16 bytes UTF-8)
+     pureKey = "WXNyfgYJffWxZm0bly3nts1/Yi/yZXJwHTcAll3lzETRUX1bNncAIeX2kg3J4O1NCpHhUiSW3DdQs9ZLdwNEqA=="
+     Decrypt -> "34d80508ab4a03043f014a66840ba23w:585280b3543d2d89"
+     encryptKey = "34d80508ab4a03043f014a66840ba23w" (32 bytes)
+     encryptIv  = "585280b3543d2d89" (16 bytes)
+  2. AES-256-CBC encrypt password with PKCS7 padding
+     AES.encrypt("123456") = "h1glmyQ2dTe2r+ARoXsgbQ==" (HAR verified!)
 
 Flow (all HAR-verified):
   0. Follow short refer link -> 302 redirect -> extract partner + userId
   0a. Pre-login indexV4 with referral sourceurl (HAR Entry 131)
   1. Generate random Indian phone (starts 6/7/8/9, 10 digits)
-  2. Register    : POST /user/register/account  (partner, itemuserfor=freespin)
-  3. Login      : POST /user/login/account    (returns token)
-  4. Gift status : GET  /opendata/homepage/registGifts
-  5. Homepage   : POST /opendata/homepage/indexV4
-  6. Free package: POST /user/profile/getfreepackage
-  7. Claim gift  : POST /user/profile/claimRegistGifts
-  8. Free pkg2  : POST /user/profile/getfreepackage
-  9. Language   : POST /user/profile/setlanguage
- 10. Subscribe   : POST /freetinygames/freespin/subscribe
- 11. Play 10x   : POST /freetinygames/freespin/bet
+  2. AES encrypt password
+  3. Register    : POST /user/register/account  (partner, itemuserfor=freespin)
+  4. Login      : POST /user/login/account    (returns token)
+  5. Gift status : GET  /opendata/homepage/registGifts
+  6-11. Claim gift, play spins, etc.
 
 Env:
   BOT_TOKEN  — Telegram bot token from @BotFather
@@ -36,6 +42,8 @@ import re
 import json
 import random
 import time
+import hashlib
+import base64
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -46,6 +54,78 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+
+# ---- AES Encryption (HAR + JS source verified) ----
+# Step 1: Decrypt pureKey to get encryptKey + encryptIv
+# These are hardcoded in the JS source (Entry 88: index-BT3HxEvK.js)
+_AES_DECRYPT_KEY = b"3dfe30508ab4a03043f014a6684034ff"  # 32 bytes
+_AES_DECRYPT_IV = b"fe3480b3543dytj3"                  # 16 bytes
+_AES_PURE_KEY = "WXNyfgYJffWxZm0bly3nts1/Yi/yZXJwHTcAll3lzETRUX1bNncAIeX2kg3J4O1NCpHhUiSW3DdQs9ZLdwNEqA=="
+
+# Decrypted pureKey = "34d80508ab4a03043f014a66840ba23w:585280b3543d2d89"
+# encryptKey = "34d80508ab4a03043f014a66840ba23w" (32 bytes)
+# encryptIv  = "585280b3543d2d89" (16 bytes)
+_AES_ENCRYPT_KEY = b"34d80508ab4a03043f014a66840ba23w"  # 32 bytes
+_AES_ENCRYPT_IV = b"585280b3543d2d89"                     # 16 bytes
+
+
+def aes_encrypt(plaintext):
+    """AES-256-CBC encrypt with PKCS7 padding (HAR + JS verified).
+    Uses pure Python implementation (no external deps needed).
+    HAR proof: aes_encrypt("123456") == "h1glmyQ2dTe2r+ARoXsgbQ=="
+    """
+    # PKCS7 padding
+    key = _AES_ENCRYPT_KEY
+    iv = _AES_ENCRYPT_IV
+    data = plaintext.encode("utf-8")
+    pad_len = 16 - (len(data) % 16)
+    padded = data + bytes([pad_len]) * pad_len
+    
+    # AES-256-CBC encryption using pure Python
+    # We use the built-in hashlib for key schedule, but need actual AES
+    # Since we can't use pycryptodome, we implement AES from scratch
+    # Actually, Python's hashlib doesn't have AES. Let's use a different approach.
+    # We can use the 'cryptography' package if available, or implement AES manually.
+    # 
+    # Actually, the simplest approach: use subprocess to call node.js
+    # which is available on Railway (npm/node) and can do AES natively.
+    # But for portability, let's try Python first.
+    
+    # Try using 'cryptography' package first
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives import padding as sym_padding
+        from cryptography.hazmat.backends import default_backend
+        
+        padder = sym_padding.PKCS7(128).padder()
+        padded_data = padder.update(data) + padder.finalize()
+        
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted = encryptor.update(padded_data) + encryptor.finalize()
+        return base64.b64encode(encrypted).decode("utf-8")
+    except ImportError:
+        pass
+    
+    # Fallback: use subprocess with node.js (available on Railway)
+    import subprocess
+    node_script = '''
+const crypto = require('crypto');
+const key = Buffer.from(process.argv[1], 'utf8');
+const iv = Buffer.from(process.argv[2], 'utf8');
+const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+let encrypted = cipher.update(process.argv[3], 'utf8');
+encrypted = Buffer.concat([encrypted, cipher.final()]);
+process.stdout.write(encrypted.toString('base64'));
+'''
+    result = subprocess.run(
+        ["node", "-e", node_script, key.decode("utf-8"), iv.decode("utf-8"), plaintext],
+        capture_output=True, text=True, timeout=10
+    )
+    if result.returncode == 0 and result.stdout:
+        return result.stdout.strip()
+    raise RuntimeError("AES encryption failed: no cryptography package and node.js not available")
+
 
 # ---- Verified constants (from original HAR file) ----
 H5_HOST = "https://h5server.betfuguapi.com"
@@ -69,7 +149,7 @@ NUM_SPINS = 10
 FIXED_PASSWORD = "123456"
 SET_LANGUAGE = "en-US"
 
-# ---- HAR-verified headers for H5 host (h5server.betfuguapi.com) ----
+# ---- HAR-verified headers for H5 host ----
 H5_BASE_HEADERS = {
     "accept": "application/json, text/plain, */*",
     "content-type": "application/json;charset=UTF-8",
@@ -102,7 +182,6 @@ H5_BASE_HEADERS = {
     "sourceurl": "https://betfugu02.com/bf_pwa/index.html#/",
 }
 
-# ---- HAR-verified headers for GAME host (game.betfuguapi.com) ----
 GAME_BASE_HEADERS = {
     "accept": "*/*",
     "content-type": "application/json",
@@ -125,10 +204,7 @@ REDIRECT_HEADERS = {
 
 def call_api(method, host, path, body=None, token=None, partner=None, game=False, sourceurl=None):
     """Make single API call, return (http_status, response_json).
-
-    HAR PROOF: All POST calls use body='{}' (bodySize=2). NOT None/empty.
-    HAR PROOF: Token goes in `access-token` header (NOT `Authorization: Bearer`).
-    HAR PROOF: H5 host needs ~25 custom headers. Game host needs ~6 basic headers.
+    HAR PROOF: POST calls use body='{}' (bodySize=2). Token in `access-token` header.
     """
     url = host + path
 
@@ -173,17 +249,12 @@ def call_api(method, host, path, body=None, token=None, partner=None, game=False
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Prevent urllib from auto-following 302 redirects."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
 def follow_short_link_and_get_partner(short_url):
-    """
-    Follow short refer link -> 302 redirect -> extract partner code and userId.
-    HAR Entry 3:  GET s.betfugu01.com/ezzwvl51eipuy39 -> 302
-    HAR Entry 8:  GET betfugu02.com/app/index.html?userId=2335316&cury=INR&partner=66666666
-    """
+    """Follow short refer link -> 302 redirect -> extract partner + userId."""
     req = urllib.request.Request(short_url, headers=REDIRECT_HEADERS, method="GET")
     opener = urllib.request.build_opener(NoRedirectHandler())
     try:
@@ -196,19 +267,18 @@ def follow_short_link_and_get_partner(short_url):
             raise
 
     if not final_url:
-        return None, None, "No redirect Location found"
+        return None, None, "", "No redirect Location found"
 
     parsed = urlparse(final_url)
     params = parse_qs(parsed.query)
     partner = params.get("partner", [None])[0]
     user_id = params.get("userId", [None])[0]
-    cury = params.get("cury", ["INR"])[0]
     rtm = params.get("rtm", [""])[0]
 
     if not partner or partner == "undefined":
-        return None, None, "Partner not found in redirect URL: {}".format(final_url)
+        return None, None, "", "Partner not found in redirect URL: {}".format(final_url)
 
-    return partner, user_id, final_url
+    return partner, user_id, rtm, final_url
 
 
 def generate_random_phone():
@@ -221,18 +291,9 @@ def generate_random_phone():
 # ---- BetFugu API steps (all HAR-verified) ----
 
 def step_prelogin_referral_index_v4(partner, user_id, rtm):
-    """HAR Entry 131 - POST /opendata/homepage/indexV4  (BEFORE register, NO token)
-
-    This is the REFERRAL TRACKING call. The browser calls indexV4 BEFORE
-    registering, with sourceurl containing userId, cury, partner, rtm
-    from the redirect URL. Server uses this to track who referred the user.
-
-    HAR proof - Entry 131 sourceurl:
-      https://betfugu02.com/bf_pwa/index.html?userId=2335316&cury=INR&partner=66666666&rtm=1783147761401#/
-
-    Without this call, refer bonus is NOT credited to the referrer.
+    """HAR Entry 131 - POST /opendata/homepage/indexV4 (BEFORE register, NO token)
+    Referral tracking call. sourceurl must contain userId from redirect URL.
     """
-    # Build sourceurl with referrer userId (HAR exact format)
     if user_id and user_id != "undefined":
         sourceurl = (
             "https://betfugu02.com/bf_pwa/index.html"
@@ -251,20 +312,17 @@ def step_prelogin_referral_index_v4(partner, user_id, rtm):
     return True, "Referral tracked \u2705 (userId={})".format(user_id)
 
 
-def step_register(phone, password, partner, user_id, rtm):
+def step_register(phone, encrypted_password, partner):
     """HAR Entry 271 - POST /user/register/account
-    Body: {account, password, partner, itemuserfor:"freespin"}
-    Response: {"code":200}
-
-    Register sourceurl goes to #/login page (HAR Entry 271).
+    Body: {account, password(AES-encrypted), partner, itemuserfor:"freespin"}
+    KEY: password must be AES encrypted (HAR proves this).
     """
     body = {
         "account": phone,
-        "password": password,
+        "password": encrypted_password,
         "partner": int(partner),
         "itemuserfor": VERIFIED_ITEMUSERFOR,
     }
-    # HAR Entry 271 sourceurl: https://betfugu02.com/bf_pwa/index.html#/login
     sourceurl = "https://betfugu02.com/bf_pwa/index.html#/login"
     status, resp = call_api("POST", H5_HOST, PATH_REGISTER, body=body,
                            partner=partner, sourceurl=sourceurl)
@@ -273,13 +331,12 @@ def step_register(phone, password, partner, user_id, rtm):
     return True, "Registered \u2705 (code 200)"
 
 
-def step_login(phone, password, partner, user_id, rtm):
+def step_login(phone, encrypted_password, partner):
     """HAR Entry 274 - POST /user/login/account
-    Body: {account, password}
-    Response: {"code":200, "token":"..."}
+    Body: {account, password(AES-encrypted)}
+    KEY: password must be AES encrypted (same as register).
     """
-    body = {"account": phone, "password": password}
-    # After login, sourceurl becomes #/ (no userId)
+    body = {"account": phone, "password": encrypted_password}
     sourceurl = "https://betfugu02.com/bf_pwa/index.html#/"
     status, resp = call_api("POST", H5_HOST, PATH_LOGIN, body=body,
                            partner=partner, sourceurl=sourceurl)
@@ -304,9 +361,7 @@ def step_check_regist_gifts(token, partner):
 
 
 def step_homepage_index_v4(token, partner):
-    """HAR Entry 286 - POST /opendata/homepage/indexV4 (post-login)
-    Body: {} (HAR proves bodySize=2, text='{}')
-    """
+    """HAR Entry 286 - POST /opendata/homepage/indexV4 (post-login)"""
     status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={}, token=token, partner=partner)
     if status != 200:
         return False, "Homepage FAIL: HTTP {} {}".format(status, resp)
@@ -316,7 +371,7 @@ def step_homepage_index_v4(token, partner):
 
 
 def step_get_free_package(token, partner):
-    """HAR Entry 283 - POST /user/profile/getfreepackage  (before claim)"""
+    """HAR Entry 283 - POST /user/profile/getfreepackage (before claim)"""
     status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token, partner=partner)
     if status != 200:
         return False, "Free package FAIL: HTTP {} {}".format(status, resp)
@@ -326,10 +381,7 @@ def step_get_free_package(token, partner):
 
 
 def step_claim_gift(token, partner):
-    """HAR Entry 288 - POST /user/profile/claimRegistGifts
-    Body: {} (HAR: bodySize=2, text='{}')
-    Response: {"code":200,"items":[{"id":"freespinbet10","num":10}]}
-    """
+    """HAR Entry 288 - POST /user/profile/claimRegistGifts"""
     status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body={}, token=token, partner=partner)
     if status != 200:
         return False, "Claim gift FAIL: HTTP {} {}".format(status, resp)
@@ -344,7 +396,7 @@ def step_claim_gift(token, partner):
 
 
 def step_get_free_package_after_claim(token, partner):
-    """HAR Entry 293 - POST /user/profile/getfreepackage  (after claim)"""
+    """HAR Entry 293 - POST /user/profile/getfreepackage (after claim)"""
     status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token, partner=partner)
     if status != 200:
         return False, "Free package (after) FAIL: HTTP {} {}".format(status, resp)
@@ -357,9 +409,7 @@ def step_get_free_package_after_claim(token, partner):
 
 
 def step_set_language(token, partner):
-    """HAR Entry 298 - POST /user/profile/setlanguage
-    Body: {"language":"en-US"}
-    """
+    """HAR Entry 298 - POST /user/profile/setlanguage"""
     body = {"language": SET_LANGUAGE}
     status, resp = call_api("POST", H5_HOST, PATH_SET_LANGUAGE, body=body, token=token, partner=partner)
     if status != 200:
@@ -370,10 +420,7 @@ def step_set_language(token, partner):
 
 
 def step_freespin_subscribe(token):
-    """HAR Entry 618 - POST /freetinygames/freespin/subscribe
-    Body: {"tyid":"freespinbet10"}
-    Uses GAME host with game-specific headers.
-    """
+    """HAR Entry 618 - POST /freetinygames/freespin/subscribe"""
     body = {"tyid": SUBSCRIBE_TYID}
     status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_SUBSCRIBE, body=body, token=token, game=True)
     if status != 200 or resp.get("code") != 200:
@@ -382,11 +429,7 @@ def step_freespin_subscribe(token):
 
 
 def step_play_spins(token):
-    """HAR Entries 624-651 - POST /freetinygames/freespin/bet
-    10 calls. Body: {} (HAR: bodySize=2, text='{}').
-    Response has tycount (remaining spins): 9,8,7,...,0.
-    Uses GAME host with game-specific headers.
-    """
+    """HAR Entries 624-651 - POST /freetinygames/freespin/bet (10 calls)"""
     results = []
     total_win = 0
     for i in range(NUM_SPINS):
@@ -413,14 +456,10 @@ def run_full_flow(refer_link):
     # Step 0 - Follow short link, extract partner + userId + rtm
     report.append("\U0001f3b0 BetFugu Auto-Register")
     report.append("Refer link: {}".format(refer_link))
-    partner, user_id, redirect_url = follow_short_link_and_get_partner(refer_link)
+    partner, user_id, rtm, redirect_url = follow_short_link_and_get_partner(refer_link)
     if not partner:
         report.append("\u274c Partner extract FAIL: {}".format(redirect_url))
         return False, "\n".join(report)
-    # Extract rtm from redirect URL
-    parsed = urlparse(redirect_url)
-    params = parse_qs(parsed.query)
-    rtm = params.get("rtm", [""])[0]
     report.append("Partner: {} (from 302 redirect)".format(partner))
     if user_id:
         report.append("Referrer userId: {}".format(user_id))
@@ -434,30 +473,34 @@ def run_full_flow(refer_link):
     report.append("")
 
     # Step 0a - Pre-login referral tracking (HAR Entry 131)
-    # THIS IS THE KEY FOR REFER BONUS!
-    # Browser calls indexV4 BEFORE register with sourceurl containing userId
-    # Server tracks the referral from this call.
     if user_id and user_id != "undefined":
         ok, msg = step_prelogin_referral_index_v4(partner, user_id, rtm)
         report.append("0\ufe0f\u20e3 Referral track: {}".format(msg))
         if not ok:
-            # Non-fatal - continue even if this fails
             report.append("   (continuing anyway...)")
     else:
         report.append("0\ufe0f\u20e3 Referral track: Skipped (no userId in refer link)")
     report.append("")
 
-    # Step 1 - Register (with login sourceurl like HAR Entry 271)
-    ok, msg = step_register(phone, password, partner, user_id, rtm)
+    # AES encrypt the password (HAR verified!)
+    try:
+        encrypted_password = aes_encrypt(password)
+        report.append("AES encrypt: \u2705 {}".format(encrypted_password[:20] + "..."))
+    except Exception as e:
+        report.append("AES encrypt: \u274c FAIL: {}".format(e))
+        return False, "\n".join(report)
+    report.append("")
+
+    # Step 1 - Register (with AES-encrypted password)
+    ok, msg = step_register(phone, encrypted_password, partner)
     report.append("1\ufe0f\u20e3 Register: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
 
-    # Small delay to let server process registration
     time.sleep(0.5)
 
-    # Step 2 - Login
-    token, msg = step_login(phone, password, partner, user_id, rtm)
+    # Step 2 - Login (with same AES-encrypted password)
+    token, msg = step_login(phone, encrypted_password, partner)
     report.append("2\ufe0f\u20e3 Login: {}".format(msg))
     if not token:
         return False, "\n".join(report)
@@ -474,7 +517,7 @@ def run_full_flow(refer_link):
     if not ok:
         return False, "\n".join(report)
 
-    # Step 5 - Free package check (before claim)
+    # Step 5 - Free package check
     ok, msg = step_get_free_package(token, partner)
     report.append("5\ufe0f\u20e3 Free package (pre): {}".format(msg))
     if not ok:
@@ -486,7 +529,7 @@ def run_full_flow(refer_link):
     if not ok:
         return False, "\n".join(report)
 
-    # Step 7 - Free package check (after claim)
+    # Step 7 - Free package after claim
     ok, msg = step_get_free_package_after_claim(token, partner)
     report.append("7\ufe0f\u20e3 Free package (post): {}".format(msg))
 
@@ -494,7 +537,7 @@ def run_full_flow(refer_link):
     ok, msg = step_set_language(token, partner)
     report.append("8\ufe0f\u20e3 Language: {}".format(msg))
 
-    # Step 9 - Subscribe to free spin
+    # Step 9 - Subscribe
     ok, msg = step_freespin_subscribe(token)
     report.append("9\ufe0f\u20e3 Subscribe: {}".format(msg))
     if not ok:
@@ -526,11 +569,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /register <REFER_LINK>
-    Refer link format: https://s.betfugu01.com/xxxxx
-    Bot follows 302 redirect -> extracts partner -> registers -> plays spins.
-    """
     if not context.args:
         await update.message.reply_text(
             "\u26a0\ufe0f Refer link do!\n\n"
@@ -540,14 +578,10 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     refer_link = " ".join(context.args)
-
     msg = await update.message.reply_text(
         "\U0001f504 Processing refer link...\n{}".format(refer_link)
     )
-
     success, report = run_full_flow(refer_link)
-
-    # Send report in chunks (Telegram 4096 char limit)
     for i in range(0, len(report), 4000):
         chunk = report[i:i+4000]
         if i == 0:
@@ -563,9 +597,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Bot kya karta hai:\n"
         "\u2022 Short refer link follow -> 302 redirect -> partner + userId extract\n"
         "\u2022 Pre-login indexV4 with referral sourceurl (refer bonus track)\n"
+        "\u2022 Password AES-256-CBC encrypted (HAR verified)\n"
         "\u2022 Random 10-digit phone (6/7/8/9 se start)\n"
-        "\u2022 Password: 123456\n"
-        "\u2022 Register -> Login -> Gift check -> Homepage -> Free pkg -> Claim -> Play 10 spins\n\n"
+        "\u2022 Register -> Login -> Gift check -> Claim -> Play 10 spins\n\n"
         "Example:\n"
         "`/register https://s.betfugu01.com/ezzwvl51eipuy39`",
         parse_mode="Markdown",
@@ -576,18 +610,12 @@ def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         print("ERROR: BOT_TOKEN env variable set nahi hai!")
-        print("Railway Variables me BOT_TOKEN=xxx add karo")
         raise SystemExit(1)
-
     print("BetFugu Auto-Register TG Bot starting...")
-    print("Token: {}...{}".format(token[:8], token[-3:]))
-
     app = ApplicationBuilder().token(token).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("help", cmd_help))
-
     print("Bot polling...")
     app.run_polling()
 
