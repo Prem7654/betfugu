@@ -4,13 +4,15 @@ BetFugu Auto-Register + Free Spin Bot — Telegram + HAR-verified.
 No guessing. Every endpoint, field, value from HAR report.
 
 Flow (all HAR-verified):
-  1. Parse partner code from user's refer link
-  2. Generate random Indian phone (starts 6/7/8/9, 10 digits)
-  3. Register  : POST /user/register/account  (partner from link, itemuserfor=freespin)
-  4. Login      : POST /user/login/account     (returns token)
-  5. Claim gift : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
-  6. Subscribe  : POST /freetinygames/freespin/subscribe  (tyid=freespinbet10)
-  7. Play 10x   : POST /freetinygames/freespin/bet  (10 calls, until tycount=0)
+  0. Follow short refer link → 302 redirect → extract partner code
+     (HAR Entry 3: s.betfugu01.com/ezzwvl51eipuy39 → 302)
+     (HAR Entry 8: betfugu02.com/app/index.html?userId=2335316&partner=66666666)
+  1. Generate random Indian phone (starts 6/7/8/9, 10 digits)
+  2. Register      : POST /user/register/account  (partner from redirect, itemuserfor=freespin)
+  3. Login        : POST /user/login/account     (returns token)
+  4. Claim gift   : POST /user/profile/claimRegistGifts  (freespinbet10 x10)
+  5. Subscribe    : POST /freetinygames/freespin/subscribe  (tyid=freespinbet10)
+  6. Play 10x     : POST /freetinygames/freespin/bet  (10 calls, until tycount=0)
 
 Env:
   BOT_TOKEN  — Telegram bot token from @BotFather
@@ -48,7 +50,7 @@ EXPECTED_GIFT_ID = "freespinbet10"
 EXPECTED_GIFT_NUM = 10
 # HAR Entry 618: subscribe request body
 SUBSCRIBE_TYID = "freespinbet10"
-# HAR Entry 624-651: 10 bet calls, final tycount=0
+# HAR Entries 624-651: 10 bet calls, final tycount=0
 NUM_SPINS = 10
 FIXED_PASSWORD = "123456"
 
@@ -61,6 +63,14 @@ COMMON_HEADERS = {
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
     ),
+}
+
+REDIRECT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 
@@ -94,25 +104,49 @@ def call_api(method, host, path, body=None, token=None, extra_params=None):
         return e.code, parsed
 
 
-def parse_partner_from_link(link):
+def follow_short_link_and_get_partner(short_url):
     """
-    Extract partner code from refer link.
-    HAR proves partner comes as URL param: partner=66666666
-    (HAR lines 15870, 15944, 16312 — URL: ?partner=66666666)
+    Follow short refer link → 302 redirect → extract partner code.
+
+    HAR proof:
+      Entry 3:  GET s.betfugu01.com/ezzwvl51eipuy39 → 302 (text/html, 123 bytes)
+      Entry 8:  GET betfugu02.com/app/index.html?userId=2335316&cury=INR&partner=66666666&rtm=...
+
+    The 302 redirect Location header contains the full URL with partner=XXX.
+    We do NOT follow the redirect body — just read the Location header.
     """
+    req = urllib.request.Request(short_url, headers=REDIRECT_HEADERS, method="GET")
+    # Use a handler that does NOT auto-follow redirects
+    opener = urllib.request.build_opener(NoRedirectHandler())
     try:
-        parsed = urlparse(link)
-        params = parse_qs(parsed.query)
-        partner = params.get("partner", [None])[0]
-        if partner:
-            return partner
-    except Exception:
-        pass
-    # Try regex fallback if URL format different
-    match = re.search(r'partner=(\d+)', link)
-    if match:
-        return match.group(1)
-    return None
+        resp = opener.open(req, timeout=15)
+        # If somehow no redirect, check response URL
+        final_url = resp.url
+    except urllib.error.HTTPError as e:
+        if e.code == 302:
+            final_url = e.headers.get("Location", "")
+        else:
+            raise
+
+    if not final_url:
+        return None, None, "No redirect Location found"
+
+    # Parse partner and userId from redirect URL
+    parsed = urlparse(final_url)
+    params = parse_qs(parsed.query)
+    partner = params.get("partner", [None])[0]
+    user_id = params.get("userId", [None])[0]
+
+    if not partner or partner == "undefined":
+        return None, None, "Partner not found in redirect URL: {}".format(final_url)
+
+    return partner, user_id, final_url
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent urllib from auto-following 302 redirects."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
 def generate_random_phone():
@@ -210,20 +244,31 @@ def step_play_spins(token):
     return True, "\n".join(results) + "\nTotal win: {}".format(total_win)
 
 
-def run_full_flow(partner_code):
+def run_full_flow(refer_link):
     """Run complete auto-registration + free spin flow."""
     report = []
+
+    # Step 0 — Follow short link, extract partner
+    report.append("🎰 BetFugu Auto-Register")
+    report.append("Refer link: {}".format(refer_link))
+    partner, user_id, redirect_url = follow_short_link_and_get_partner(refer_link)
+    if not partner:
+        report.append("❌ Partner extract FAIL: {}".format(redirect_url))
+        return False, "\n".join(report)
+    report.append("Partner: {} (from 302 redirect)".format(partner))
+    if user_id:
+        report.append("Referrer userId: {}".format(user_id))
+    report.append("")
+
     phone = generate_random_phone()
     password = FIXED_PASSWORD
 
-    report.append("🎰 BetFugu Auto-Register")
     report.append("Phone: {}".format(phone))
     report.append("Password: {}".format(password))
-    report.append("Partner: {} (from refer link)".format(partner_code))
     report.append("")
 
     # Step 1 — Register
-    ok, msg = step_register(phone, password, partner_code)
+    ok, msg = step_register(phone, password, partner)
     report.append("1️⃣ Register: {}".format(msg))
     if not ok:
         return False, "\n".join(report)
@@ -251,7 +296,7 @@ def run_full_flow(partner_code):
     ok, spin_report = step_play_spins(token)
     report.append(spin_report)
     report.append("")
-    report.append("✅ Done! Registration + 10 free spins khel diye.")
+    report.append("✅ Done! Registration + 10 free spins complete.")
 
     return True, "\n".join(report)
 
@@ -265,10 +310,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "`/register <REFER_LINK>` — refer link do, bot auto register + 10 free spins kheliga\n"
         "`/help` — help\n\n"
-        "Flow:\n"
-        "1. Random phone (6/7/8/9 se start)\n"
-        "2. Password: 123456\n"
-        "3. Register → Login → Claim gift → Play 10 spins",
+        "Example:\n"
+        "`/register https://s.betfugu01.com/ezzwvl51eipuy39`",
         parse_mode="Markdown",
     )
 
@@ -276,33 +319,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /register <REFER_LINK>
+    Refer link format: https://s.betfugu01.com/xxxxx
+    Bot follows 302 redirect → extracts partner → registers → plays spins.
     """
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Refer link do!\n\nUse: `/register https://betfugu02.com/...?partner=XXXXXX`",
+            "⚠️ Refer link do!\n\n"
+            "Use: `/register https://s.betfugu01.com/ezzwvl51eipuy39`",
             parse_mode="Markdown",
         )
         return
 
     refer_link = " ".join(context.args)
-    partner = parse_partner_from_link(refer_link)
-
-    if not partner:
-        await update.message.reply_text(
-            "❌ Refer link me partner code nahi mila.\n"
-            "Link me `partner=XXXXXX` hona chahiye.\n\n"
-            "Example: `/register https://betfugu02.com/?partner=66666666`",
-            parse_mode="Markdown",
-        )
-        return
 
     msg = await update.message.reply_text(
-        "🔄 Starting auto-registration...\n"
-        "Partner: {}\n"
-        "Generating random phone...".format(partner)
+        "🔄 Processing refer link...\n{}".format(refer_link)
     )
 
-    success, report = run_full_flow(partner)
+    success, report = run_full_flow(refer_link)
 
     # Send report in chunks (Telegram 4096 char limit)
     for i in range(0, len(report), 4000):
@@ -318,16 +352,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *Help*\n\n"
         "`/register <REFER_LINK>` — auto register + 10 free spins\n\n"
         "Bot kya karta hai:\n"
-        "• Refer link se partner code nikalta hai\n"
+        "• Short refer link follow → 302 redirect → partner code extract\n"
         "• Random 10-digit phone (6/7/8/9 se start)\n"
         "• Password: 123456\n"
         "• Register → Login → Claim gift → Subscribe → 10 spins khelta hai\n\n"
+        "Example:\n"
+        "`/register https://s.betfugu01.com/ezzwvl51eipuy39`\n\n"
         "Verified from HAR:\n"
-        "• Register: POST /user/register/account\n"
-        "• Login: POST /user/login/account\n"
-        "• Gift: POST /user/profile/claimRegistGifts\n"
-        "• Subscribe: POST /freetinygames/freespin/subscribe\n"
-        "• Bet: POST /freetinygames/freespin/bet (10x)",
+        "• Short link → 302 → partner (Entry 3→8)\n"
+        "• Register: POST /user/register/account (Entry 271)\n"
+        "• Login: POST /user/login/account (Entry 274)\n"
+        "• Gift: POST /user/profile/claimRegistGifts (Entry 288)\n"
+        "• Subscribe: POST /freetinygames/freespin/subscribe (Entry 618)\n"
+        "• Bet: POST /freetinygames/freespin/bet x10 (Entries 624-651)",
         parse_mode="Markdown",
     )
 
