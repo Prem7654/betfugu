@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-BetFugu Auto-Register + Free Spin Bot - Telegram + HAR-verified.
-No guessing. Every endpoint, header, body from original HAR file (1037 entries).
-KEY FIXES: see comments inline.
+BetFugu Auto-Register Bot - Telegram + HTTP WebApp server.
+Serves index.html on port 8080 (Railway) so browser uses phone IP.
+Telegram bot runs in background thread.
 """
 
 import os
@@ -13,16 +13,14 @@ import time
 import uuid
 import base64
 import socket
+import threading
+import http.server
 import urllib.request
 import urllib.error
-from urllib.parse import import urlencode, urlparse, parse_qs
+from urllib.parse import urlencode, urlparse, parse_qs
 
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 _AES_ENCRYPT_KEY = b"34d80508ab4a03043f014a66840ba23w"
 _AES_ENCRYPT_IV = b"585280b3543d2d89"
@@ -45,7 +43,7 @@ def aes_encrypt(plaintext):
     except ImportError:
         pass
     import subprocess
-    node_js = "const crypto=require(\"crypto\");const k=Buffer.from(process.argv[1],\"utf8\");const v=Buffer.from(process.argv[2],\"utf8\");const c=crypto.createCipheriv(\"aes-256-cbc\",k,v);let e=c.update(process.argv[3],\"utf8\");e=Buffer.concat([e,c.final()]);process.stdout.write(e.toString("base64"));"
+    node_js = "const crypto=require('crypto');const k=Buffer.from(process.argv[1],'utf8');const v=Buffer.from(process.argv[2],'utf8');const c=crypto.createCipheriv('aes-256-cbc',k,v);let e=c.update(process.argv[3],'utf8');e=Buffer.concat([e,c.final()]);process.stdout.write(e.toString('base64'));"
     result = subprocess.run(["node", "-e", node_js, key.decode("utf-8"), iv.decode("utf-8"), plaintext], capture_output=True, text=True, timeout=10)
     if result.returncode == 0 and result.stdout:
         return result.stdout.strip()
@@ -136,30 +134,14 @@ def make_h5_headers(token=None, partner=None, sourceurl=None):
         "origin": "https://betfugu02.com",
         "referer": "https://betfugu02.com/",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
-        "language": "en-US",
-        "appid": "wecardgame",
-        "channel": "test",
-        "currency": "INR",
-        "version": "2.11.56",
-        "timezone": "Asia/Calcutta",
-        "timeoffset": "-330",
-        "network": "4g",
-        "publisher": "release",
-        "platform": "Unknown",
-        "basepkgname": "h5",
-        "pkgname": "h5",
-        "osv": "10",
-        "weblang": "en-US",
-        "weblangs": "en-US,en,en-IN",
-        "isfrom": "other_h5",
-        "ispwa": "true",
-        "webfonts": "Microsoft YaHei",
-        "deviceid": "",
+        "language": "en-US", "appid": "wecardgame", "channel": "test", "currency": "INR",
+        "version": "2.11.56", "timezone": "Asia/Calcutta", "timeoffset": "-330",
+        "network": "4g", "publisher": "release", "platform": "Unknown", "basepkgname": "h5",
+        "pkgname": "h5", "osv": "10", "weblang": "en-US", "weblangs": "en-US,en,en-IN",
+        "isfrom": "other_h5", "ispwa": "true", "webfonts": "Microsoft YaHei", "deviceid": "",
         "visitorid": HAR_VISITOR_ID,
         "sourceurl": sourceurl or "https://betfugu02.com/bf_pwa/index.html#/",
-        "webrtc": get_webrtc_ip(),
-        "trackertoken": "",
-        "trackername": "",
+        "webrtc": get_webrtc_ip(), "trackertoken": "", "trackername": "",
     }
     if partner:
         headers["partner"] = str(partner)
@@ -169,23 +151,14 @@ def make_h5_headers(token=None, partner=None, sourceurl=None):
 
 
 GAME_BASE_HEADERS = {
-    "accept": "*/*",
-    "content-type": "application/json",
-    "origin": "https://www.betfugu02.com",
-    "referer": "https://www.betfugu02.com/",
+    "accept": "*/*", "content-type": "application/json",
+    "origin": "https://www.betfugu02.com", "referer": "https://www.betfugu02.com/",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
 }
 
-REDIRECT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
 SHORTURL_HEADERS = {
-    "accept": "*/*",
-    "content-type": "application/json",
-    "origin": "https://betfugu02.com",
-    "referer": "https://betfugu02.com/",
+    "accept": "*/*", "content-type": "application/json",
+    "origin": "https://betfugu02.com", "referer": "https://betfugu02.com/",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
 }
 
@@ -227,7 +200,7 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def follow_short_link_and_get_partner(short_url):
-    req = urllib.request.Request(short_url, headers=REDIRECT_HEADERS, method="GET")
+    req = urllib.request.Request(short_url, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
     opener = urllib.request.build_opener(NoRedirectHandler())
     try:
         resp = opener.open(req, timeout=15)
@@ -255,24 +228,6 @@ def generate_random_phone():
     return first_digit + rest
 
 
-def step_client_log(pwa_uuid, event):
-    body = {"logname": "pwa_log", "event": event, "content": {"pwa_uuid": pwa_uuid}}
-    url = H5_HOST + PATH_CLIENT_LOG
-    data = json.dumps(body).encode("utf-8")
-    headers = {
-        "content-type": "application/json;charset=UTF-8",
-        "origin": "https://betfugu02.com",
-        "referer": "https://betfugu02.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
-    }
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status == 200, event + " logged"
-    except Exception:
-        return False, event + " FAIL"
-
-
 def step_shorturl():
     rtm = str(int(time.time() * 1000))
     body = {"text": "https://betfugu02.com/app/index.html?userId=undefined&cury=INR&partner=undefined&rtm=" + rtm}
@@ -286,272 +241,100 @@ def step_shorturl():
         return False, "shorturl FAIL: " + str(e)
 
 
-def step_prelogin_index_v4(partner, sourceurl):
-    status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={}, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return False, "indexV4 FAIL"
-    return True, "indexV4 OK"
-
-
-def step_prelogin_dayly_jackpot(partner, sourceurl):
-    body = {"id": "daylyJackpot", "version": "1"}
-    status, resp = call_api("POST", H5_HOST, PATH_DAYLY_JACKPOT, body=body, partner=partner, sourceurl=sourceurl)
-    if status != 200:
-        return False, "daylyJackpot FAIL"
-    return True, "daylyJackpot OK"
-
-
-def step_prelogin_game_configs(partner, sourceurl):
-    status, resp = call_api("GET", H5_HOST, PATH_GAME_CONFIGS, partner=partner, sourceurl=sourceurl)
-    if status != 200:
-        return False, "gameConfigs FAIL"
-    return True, "gameConfigs OK"
-
-
-def step_prelogin_item_config(partner, sourceurl):
-    status, resp = call_api("POST", H5_HOST, PATH_ITEM_CONFIG, body={}, partner=partner, sourceurl=sourceurl)
-    if status != 200:
-        return False, "itemConfig FAIL"
-    return True, "itemConfig OK"
-
-
-def step_register(phone, encrypted_password, partner, sourceurl):
-    body = {"account": phone, "password": encrypted_password, "partner": int(partner), "itemuserfor": VERIFIED_ITEMUSERFOR}
-    status, resp = call_api("POST", H5_HOST, PATH_REGISTER, body=body, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return False, "Register FAIL: " + str(resp)
-    return True, "Registered ✅"
-
-
-def step_login(phone, encrypted_password, partner, sourceurl):
-    body = {"account": phone, "password": encrypted_password}
-    status, resp = call_api("POST", H5_HOST, PATH_LOGIN, body=body, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return None, "Login FAIL: " + str(resp)
-    token = resp.get("token")
-    if not token:
-        return None, "Login FAIL: no token"
-    return token, "Login ✅"
-
-
-def step_check_register_gifts(token, partner, sourceurl):
-    status, resp = call_api("GET", H5_HOST, PATH_REGISTER_GIFTS, token=token, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return False, "Gift status FAIL"
-    return True, "Gift status OK"
-
-
-def step_homepage_index_v4(token, partner, sourceurl):
-    status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={}, token=token, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return False, "Homepage FAIL"
-    return True, "Homepage OK ✅"
-
-
-def step_get_free_package(token, partner, sourceurl):
-    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return False, "Free package FAIL"
-    return True, "Free package OK ✅"
-
-
-def step_claim_gift(token, partner, sourceurl):
-    status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body={}, token=token, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return False, "Claim gift FAIL: " + str(resp)
-    items = resp.get("items") or []
-    found = any(i.get("id") == EXPECTED_GIFT_ID and i.get("num") == EXPECTED_GIFT_NUM for i in items)
-    if not found:
-        return False, "Gift mismatch: " + str(items)
-    return True, "Gift claimed ✅ freespinbet10 x10"
-
-
-def step_get_free_package_after_claim(token, partner, sourceurl):
-    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token, partner=partner, sourceurl=sourceurl)
-    if status != 200:
-        return False, "Free package (after) FAIL"
-    free_pkg = resp.get("freePackage", {})
-    if EXPECTED_GIFT_ID in free_pkg:
-        return True, "Free package verified ✅ " + str(free_pkg[EXPECTED_GIFT_ID]) + "x"
-    return True, "Free package: " + str(free_pkg)
-
-
-def step_set_language(token, partner, sourceurl):
-    body = {"language": SET_LANGUAGE}
-    status, resp = call_api("POST", H5_HOST, PATH_SET_LANGUAGE, body=body, token=token, partner=partner, sourceurl=sourceurl)
-    if status != 200 or resp.get("code") != 200:
-        return False, "Set language FAIL"
-    return True, "Language set ✅"
-
-
-def step_freespin_subscribe(token):
-    body = {"typeid": SUBSCRIBE_TYPEID}
-    status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_SUBSCRIBE, body=body, token=token, game=True)
-    if status != 200 or resp.get("code") != 200:
-        return False, "Subscribe FAIL: " + str(resp)
-    return True, "Subscribed ✅"
-
-
-def step_play_spins(token):
-    results = []
-    total_win = 0
-    for i in range(NUM_SPINS):
-        status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_BET, body={}, token=token, game=True)
-        if status != 200:
-            results.append("Spin " + str(i+1) + ": FAIL HTTP " + str(status))
-            break
-        lottery = resp.get("lotteryGameResult", {})
-        game_data = lottery.get("data", {})
-        balance = game_data.get("balance", "?")
-        win = game_data.get("win", 0)
-        tycount = resp.get("tycount", "?")
-        total_win += win if isinstance(win, (int, float)) else 0
-        results.append("Spin " + str(i+1) + "/" + str(NUM_SPINS) + ": win=" + str(win) + " bal=" + str(balance) + " left=" + str(tycount))
-        if tycount == 0 and i < NUM_SPINS - 1:
-            break
-        time.sleep(1)
-    return True, "\n".join(results) + "\nTotal win: " + str(total_win)
-
-
 def run_full_flow(refer_link):
     report = []
-    report.append("🎰 BetFugu Auto-Register")
-    report.append("Refer link: " + refer_link)
+    report.append(" BetFugu Auto-Register")
+    report.append("Refer: " + refer_link)
     partner, user_id, rtm, redirect_url = follow_short_link_and_get_partner(refer_link)
     if not partner:
         report.append("FAIL: " + redirect_url)
         return False, "\n".join(report)
     report.append("Partner: " + str(partner))
     if user_id:
-        report.append("Referrer userId: " + str(user_id))
+        report.append("Referrer: " + str(user_id))
     report.append("")
-
     pwa_uuid = generate_pwa_uuid()
-    report.append("pwa_uuid: " + pwa_uuid)
-    webrtc_ip = get_webrtc_ip()
-    report.append("webrtc IP: " + webrtc_ip)
-    if _PROXY_URL:
-        report.append("Proxy: " + _PROXY_URL)
-    report.append("")
-
-    src_no_uuid = build_sourceurl(user_id, partner, rtm, pwa_uuid=None, fragment="#/")
-    src_with_uuid = build_sourceurl(user_id, partner, rtm, pwa_uuid=pwa_uuid, fragment="#/")
-    src_with_uuid_login = build_sourceurl(user_id, partner, rtm, pwa_uuid=pwa_uuid, fragment="#/login")
-
     phone = generate_random_phone()
     report.append("Phone: " + phone)
-    report.append("Password: " + FIXED_PASSWORD + " (AES)")
+    report.append("Pwd: 123456 (AES)")
     report.append("")
-
-    ok, msg = step_client_log(pwa_uuid, "web_open")
-    report.append("0️⃣ web_open: " + msg)
+    src_login = build_sourceurl(user_id, partner, rtm, pwa_uuid, "#/login")
+    src_uuid = build_sourceurl(user_id, partner, rtm, pwa_uuid, "#/")
+    src_no_uuid = build_sourceurl(user_id, partner, rtm, None, "#/")
+    ok, msg = step_shorturl()
+    report.append("shorturl: " + msg)
+    status, resp = call_api("POST", H5_HOST, PATH_INDEX_V4, body={}, partner=partner, sourceurl=src_no_uuid)
+    report.append("indexV4: " + ("OK" if status == 200 else "FAIL"))
     time.sleep(3)
-
-    ok, msg = step_shorturl()
-    report.append("0️⃣ shorturl(1): " + msg)
-
-    ok, msg = step_prelogin_dayly_jackpot(partner, src_no_uuid)
-    report.append("0️⃣ daylyJackpot: " + msg)
-
-    ok, msg = step_prelogin_index_v4(partner, src_no_uuid)
-    report.append("1️⃣ indexV4 (no uuid): " + msg)
-    time.sleep(1)
-
-    ok, msg = step_client_log(pwa_uuid, "pwa_download")
-    report.append("0️⃣ pwa_download: " + msg)
-
-    ok, msg = step_shorturl()
-    report.append("0️⃣ shorturl(2): " + msg)
-
-    ok, msg = step_prelogin_index_v4(partner, src_with_uuid)
-    report.append("0️⃣ indexV4 (uuid): " + msg)
-
-    ok, msg = step_prelogin_dayly_jackpot(partner, src_with_uuid)
-    report.append("0️⃣ daylyJackpot(2): " + msg)
-
-    ok, msg = step_prelogin_game_configs(partner, src_with_uuid)
-    report.append("0️⃣ gameConfigs: " + msg)
-    time.sleep(1)
-
-    ok, msg = step_prelogin_item_config(partner, src_with_uuid_login)
-    report.append("0️⃣ itemConfig: " + msg)
-    report.append("")
-
-    time.sleep(5)
-
     try:
         encrypted_password = aes_encrypt(FIXED_PASSWORD)
-        report.append("AES encrypt: ✅")
     except Exception as e:
-        report.append("AES encrypt: FAIL " + str(e))
+        report.append("AES FAIL: " + str(e))
         return False, "\n".join(report)
-    report.append("")
-
-    ok, msg = step_register(phone, encrypted_password, partner, src_with_uuid_login)
-    report.append("1️⃣ Register: " + msg)
-    if not ok:
+    report.append("AES: OK")
+    body = {"account": phone, "password": encrypted_password, "partner": int(partner), "itemuserfor": VERIFIED_ITEMUSERFOR}
+    status, resp = call_api("POST", H5_HOST, PATH_REGISTER, body=body, partner=partner, sourceurl=src_login)
+    if status != 200 or resp.get("code") != 200:
+        report.append("Register FAIL: " + str(resp))
         return False, "\n".join(report)
+    report.append("Register: OK")
     time.sleep(1)
-
-    token, msg = step_login(phone, encrypted_password, partner, src_with_uuid_login)
-    report.append("2️⃣ Login: " + msg)
+    body = {"account": phone, "password": encrypted_password}
+    status, resp = call_api("POST", H5_HOST, PATH_LOGIN, body=body, partner=partner, sourceurl=src_login)
+    if status != 200 or resp.get("code") != 200:
+        report.append("Login FAIL: " + str(resp))
+        return False, "\n".join(report)
+    token = resp.get("token")
     if not token:
+        report.append("Login FAIL: no token")
         return False, "\n".join(report)
-
-    src_post = src_with_uuid
-    ok, msg = step_check_register_gifts(token, partner, src_post)
-    report.append("3️⃣ Gift status: " + msg)
-    if not ok:
-        return False, "\n".join(report)
-    ok, msg = step_get_free_package(token, partner, src_post)
-    report.append("4️⃣ Free package (pre): " + msg)
-    if not ok:
-        return False, "\n".join(report)
-    ok, msg = step_homepage_index_v4(token, partner, src_post)
-    report.append("5️⃣ Homepage: " + msg)
-    ok, msg = step_claim_gift(token, partner, src_post)
-    report.append("6️⃣ Claim gift: " + msg)
-    if not ok:
-        return False, "\n".join(report)
-    ok, msg = step_get_free_package_after_claim(token, partner, src_post)
-    report.append("7️⃣ Free package (post): " + msg)
-    ok, msg = step_set_language(token, partner, src_post)
-    report.append("8️⃣ Language: " + msg)
-    ok, msg = step_freespin_subscribe(token)
-    report.append("9️⃣ Subscribe: " + msg)
-    if not ok:
-        return False, "\n".join(report)
-
-    report.append("🎰 Playing 10 free spins...")
-    ok, spin_report = step_play_spins(token)
-    report.append(spin_report)
-    report.append("")
-    report.append("✅ Done! Registration + 10 free spins complete.")
+    report.append("Login: OK")
+    status, resp = call_api("POST", H5_HOST, PATH_GET_FREEPACKAGE, body={}, token=token, partner=partner, sourceurl=src_uuid)
+    report.append("FreePkg: " + ("OK" if status == 200 else "FAIL"))
+    status, resp = call_api("POST", H5_HOST, PATH_CLAIM_GIFT, body={}, token=token, partner=partner, sourceurl=src_uuid)
+    report.append("Claim: " + ("OK" if status == 200 else "FAIL"))
+    body = {"language": SET_LANGUAGE}
+    status, resp = call_api("POST", H5_HOST, PATH_SET_LANGUAGE, body=body, token=token, partner=partner, sourceurl=src_uuid)
+    report.append("Lang: " + ("OK" if status == 200 else "FAIL"))
+    body = {"typeid": SUBSCRIBE_TYPEID}
+    status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_SUBSCRIBE, body=body, token=token, game=True)
+    report.append("Subscribe: " + ("OK" if status == 200 else "FAIL"))
+    report.append("Spins:")
+    total_win = 0
+    for i in range(NUM_SPINS):
+        status, resp = call_api("POST", GAME_HOST, PATH_FREESPIN_BET, body={}, token=token, game=True)
+        if status != 200:
+            report.append("  Spin " + str(i+1) + ": FAIL")
+            break
+        lottery = resp.get("lotteryGameResult", {})
+        gd = lottery.get("data", {})
+        win = gd.get("win", 0)
+        bal = gd.get("balance", "?")
+        tycount = resp.get("tycount", "?")
+        total_win += win if isinstance(win, (int, float)) else 0
+        report.append("  Spin " + str(i+1) + "/10: win=" + str(win) + " bal=" + str(bal) + " left=" + str(tycount))
+        if tycount == 0 and i < NUM_SPINS - 1:
+            break
+        time.sleep(1)
+    report.append("Total win: " + str(total_win))
+    report.append("Done! Phone: " + phone)
     return True, "\n".join(report)
 
 
 async def cmd_start(update, context):
-    proxy_info = "\nProxy: " + _PROXY_URL if _PROXY_URL else "\nNo proxy set"
     await update.message.reply_text(
-        "🎰 *BetFugu Auto-Register Bot*\n\n"
-        "Commands:\n"
-        "`/register <REFER_LINK>` - auto register + 10 free spins\n"
-        "`/help` - help\n\n"
-        "Example: `/register https://s.betfugu01.com/ezzwvl51eipuy39`"
-        + proxy_info,
-        parse_mode="Markdown",
+        "BetFugu Auto-Register Bot\n\n"
+        "/register <REFER_LINK> - auto register + 10 free spins\n"
+        "Example: /register https://s.betfugu01.com/ezzwvl51eipuy39",
     )
 
 
 async def cmd_register(update, context):
     if not context.args:
-        await update.message.reply_text(
-            "Refer link do!\nUse: `/register https://s.betfugu01.com/ezzwvl51eipuy39`",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("Refer link do! /register <link>")
         return
     refer_link = " ".join(context.args)
-    msg = await update.message.reply_text("Processing... " + refer_link)
+    msg = await update.message.reply_text("Processing...")
     success, report = run_full_flow(refer_link)
     for i in range(0, len(report), 4000):
         chunk = report[i:i+4000]
@@ -562,30 +345,62 @@ async def cmd_register(update, context):
 
 
 async def cmd_help(update, context):
-    await update.message.reply_text(
-        "`/register <REFER_LINK>` - auto register + 10 free spins\n\n"
-        "Example: `/register https://s.betfugu01.com/ezzwvl51eipuy39`",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("/register <REFER_LINK> - auto register + 10 free spins")
+
+
+def run_telegram_bot():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        print("No BOT_TOKEN, skipping telegram bot")
+        return
+    print("Telegram bot starting...")
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("register", cmd_register))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.run_polling()
+
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 8080))
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    if not os.path.exists(html_path):
+        html_path = "/app/index.html"
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/" or self.path == "/index.html":
+                try:
+                    with open(html_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(content.encode("utf-8"))
+                except Exception as e:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(("Error: " + str(e)).encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.end_headers()
+        def log_message(self, format, *args):
+            pass
+    print("HTTP server starting on port " + str(port))
+    server = http.server.HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
 
 
 def main():
     _setup_proxy()
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        print("ERROR: BOT_TOKEN not set!")
-        raise SystemExit(1)
     print("BetFugu Bot starting...")
     if _PROXY_URL:
         print("Using proxy: " + _PROXY_URL)
     if _PROXY_IP:
         print("Using webrtc IP: " + _PROXY_IP)
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("register", cmd_register))
-    app.add_handler(CommandHandler("help", cmd_help))
-    print("Bot polling...")
-    app.run_polling()
+    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    bot_thread.start()
+    print("Telegram bot started in background")
+    run_http_server()
 
 
 if __name__ == "__main__":
