@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-BetFugu Auto-Register Bot - Telegram + HTTP WebApp with CORS proxy.
-Serves index.html + /api/* proxy endpoints to bypass CORS.
-Telegram bot in background thread.
+BetFugu Bot - Telegram bot for free spins.
+/register <link>  - auto register + 10 spins (old flow)
+/spin <phone> <password>  - login with your account + play 10 free spins
 """
-import os, json, random, time, uuid, base64, socket, threading
-import http.server, urllib.request, urllib.error
-from urllib.parse import urlparse, parse_qs
+import os, json, random, time, uuid, base64, threading
+import urllib.request, urllib.error
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -33,30 +32,34 @@ def aes_encrypt(pt):
     r = subprocess.run(["node","-e",js,_AES_KEY.decode(),_AES_IV.decode(),pt],capture_output=True,text=True,timeout=10)
     return r.stdout.strip() if r.returncode==0 else ""
 
-def mk_h5_headers(extra):
+def mk_h5_headers(token, partner, sourceurl):
     h = {"accept":"application/json, text/plain, */*","content-type":"application/json;charset=UTF-8",
         "origin":"https://betfugu02.com","referer":"https://betfugu02.com/",
-        "user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         "language":"en-US","appid":"wecardgame","channel":"test","currency":"INR",
         "version":"2.11.56","timezone":"Asia/Calcutta","timeoffset":"-330","network":"4g",
         "publisher":"release","platform":"Unknown","basepkgname":"h5","pkgname":"h5","osv":"10",
         "weblang":"en-US","weblangs":"en-US,en,en-IN","isfrom":"other_h5","ispwa":"true",
         "webfonts":"Microsoft YaHei","deviceid":"","visitorid":VISITOR,
-        "sourceurl":extra.get("sourceurl","https://betfugu02.com/bf_pwa/index.html#/"),
-        "webrtc":extra.get("webrtc",""),"trackertoken":"","trackername":""}
-    if extra.get("partner"): h["partner"] = str(extra["partner"])
-    if extra.get("access-token"): h["access-token"] = extra["access-token"]
-    return h
-
-def mk_game_headers(token):
-    h = {"accept":"*/*","content-type":"application/json","origin":"https://www.betfugu02.com",
-        "referer":"https://www.betfugu02.com/","user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        "sourceurl":sourceurl or "https://betfugu02.com/bf_pwa/index.html#/",
+        "webrtc":"47.31.86.36","trackertoken":"","trackername":""}
+    if partner: h["partner"] = str(partner)
     if token: h["access-token"] = token
     return h
 
-def do_call(host, path, method, body, extra, token, is_game):
+def mk_game_headers(token):
+    h = {"accept":"*/*","content-type":"application/json",
+        "origin":"https://www.betfugu02.com","referer":"https://www.betfugu02.com/",
+        "user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"}
+    if token: h["access-token"] = token
+    return h
+
+def call_api(method, host, path, body, token, partner, is_game, sourceurl):
     url = host + path
-    headers = mk_game_headers(token) if is_game else mk_h5_headers(extra or {})
+    if is_game:
+        headers = mk_game_headers(token)
+    else:
+        headers = mk_h5_headers(token, partner, sourceurl)
     data = None
     if method == "POST":
         data = json.dumps(body).encode() if body is not None else b"{}"
@@ -73,119 +76,212 @@ def do_call(host, path, method, body, extra, token, is_game):
     except Exception as e:
         return 0, {"error": str(e)}
 
-def run_flow(refer_link):
-    r = ["BetFugu Auto-Register","Refer: "+refer_link]
-    partner = "66666666"; uid = ""; rtm = str(int(time.time()*1000))
-    r.append("Partner: "+partner)
-    pwa = uuid.uuid4().hex
+def gen_pwa(): return uuid.uuid4().hex
+
+def build_src(uid, partner, rtm, pwa, frag="#/"):
+    p = "cury=INR&partner=" + str(partner) + "&rtm=" + str(rtm)
+    if uid and uid != "undefined": p = "userId=" + str(uid) + "&" + p
+    if pwa: p += "&pwa_uuid=" + pwa
+    return "https://betfugu02.com/bf_pwa/index.html?" + p + frag
+
+def run_spins(phone, password):
+    r = []
+    r.append("BetFugu Free Spins")
+    r.append("Phone: " + phone)
+    r.append("")
+    try:
+        enc = aes_encrypt(password)
+        r.append("AES encrypt: OK")
+    except Exception as e:
+        r.append("AES FAIL: " + str(e))
+        return False, "\n".join(r)
+    rtm = str(int(time.time() * 1000))
+    pwa = gen_pwa()
+    src_login = build_src("", 66666666, rtm, pwa, "#/login")
+    src_uuid = build_src("", 66666666, rtm, pwa, "#/")
+    r.append("")
+    r.append("--- Login ---")
+    body = {"account": phone, "password": enc}
+    st, resp = call_api("POST", H5, "/user/login/account", body, None, 66666666, False, src_login)
+    if st != 200 or resp.get("code") != 200:
+        r.append("Login FAIL: " + json.dumps(resp)[:300])
+        return False, "\n".join(r)
+    token = resp.get("token")
+    if not token:
+        r.append("Login FAIL: no token")
+        r.append("Response: " + json.dumps(resp)[:300])
+        return False, "\n".join(r)
+    r.append("Login: OK (token received)")
+    user_info = resp.get("data", resp)
+    uid = user_info.get("id", user_info.get("userId", "?"))
+    balance = user_info.get("balance", user_info.get("money", "?"))
+    r.append("User ID: " + str(uid))
+    r.append("Balance: " + str(balance))
+    time.sleep(1)
+    r.append("")
+    r.append("--- Subscribe to free spins ---")
+    st, resp = call_api("POST", GAME, "/freetinygames/freespin/subscribe", {"typeid": "freespinbet10"}, token, None, True, "")
+    if st == 200:
+        r.append("Subscribe: OK")
+        r.append("  Resp: " + json.dumps(resp)[:200])
+    else:
+        r.append("Subscribe: FAIL (may already be subscribed)")
+        r.append("  Resp: " + json.dumps(resp)[:200])
+    time.sleep(1)
+    r.append("")
+    r.append("--- Playing 10 free spins ---")
+    total_win = 0
+    for i in range(10):
+        st, resp = call_api("POST", GAME, "/freetinygames/freespin/bet", {}, token, None, True, "")
+        if st != 200:
+            r.append("Spin " + str(i+1) + ": FAIL HTTP " + str(st))
+            r.append("  Resp: " + json.dumps(resp)[:200])
+            break
+        lottery = resp.get("lotteryGameResult", {})
+        gd = lottery.get("data", {})
+        win = gd.get("win", 0)
+        bal = gd.get("balance", "?")
+        bet = gd.get("bet", 10)
+        tycount = resp.get("tycount", "?")
+        total_win += win if isinstance(win, (int, float)) else 0
+        r.append("Spin " + str(i+1) + "/10: win=" + str(win) + " bal=" + str(bal) + " left=" + str(tycount))
+        if tycount == 0 and i < 9:
+            r.append("No spins left!")
+            break
+        time.sleep(1)
+    r.append("")
+    r.append("Total win: " + str(total_win))
+    r.append("Done!")
+    return True, "\n".join(r)
+
+def run_register(refer_link):
+    r = ["BetFugu Auto-Register", "Refer: " + refer_link]
+    partner = "66666666"
+    uid = ""
+    rtm = str(int(time.time() * 1000))
+    r.append("Partner: " + partner)
+    pwa = gen_pwa()
     phone = random.choice("6789") + "".join(random.choice("0123456789") for _ in range(9))
-    r.append("Phone: "+phone)
-    src_login = f"https://betfugu02.com/bf_pwa/index.html?userId={uid}&cury=INR&partner={partner}&rtm={rtm}&pwa_uuid={pwa}#/login"
-    src_uuid = f"https://betfugu02.com/bf_pwa/index.html?userId={uid}&cury=INR&partner={partner}&rtm={rtm}&pwa_uuid={pwa}#/"
+    r.append("Phone: " + phone)
+    src_login = build_src(uid, partner, rtm, pwa, "#/login")
+    src_uuid = build_src(uid, partner, rtm, pwa, "#/")
+    src_no_uuid = build_src(uid, partner, rtm, None, "#/")
     try: enc = aes_encrypt("123456")
-    except Exception as e: r.append("AES FAIL: "+str(e)); return False, "\n".join(r)
-    extra = {"partner":partner,"sourceurl":src_login,"webrtc":""}
-    st, resp = do_call(H5,"/user/register/account","POST",{"account":phone,"password":enc,"partner":int(partner),"itemuserfor":"freespin"},extra,None,False)
-    if st != 200 or resp.get("code") != 200: r.append("Register FAIL: "+str(resp)); return False, "\n".join(r)
+    except Exception as e: r.append("AES FAIL: " + str(e)); return False, "\n".join(r)
+    r.append("")
+    r.append("--- Pre-login ---")
+    call_api("POST", H5, "/shorturl", {"text": "https://betfugu02.com/app/index.html?userId=undefined&cury=INR&partner=undefined&rtm=" + rtm}, None, partner, False, "https://betfugu02.com/bf_pwa/index.html#/")
+    r.append("shorturl: OK")
+    call_api("POST", H5, "/opendata/homepage/indexV4", {}, None, partner, False, src_no_uuid)
+    r.append("indexV4: OK")
+    call_api("POST", H5, "/opendata/getdaylyjackpot", {"id": "daylyJackpot", "version": "1"}, None, partner, False, src_no_uuid)
+    r.append("daylyJackpot: OK")
+    call_api("POST", H5, "/opendata/homepage/indexV4", {}, None, partner, False, src_uuid)
+    r.append("indexV4(uuid): OK")
+    call_api("GET", H5, "/opendata/gameConfigs", None, None, partner, False, src_uuid)
+    r.append("gameConfigs: OK")
+    call_api("POST", H5, "/opendata/itemConfig", {}, None, partner, False, src_login)
+    r.append("itemConfig: OK")
+    time.sleep(2)
+    r.append("")
+    r.append("--- Register ---")
+    body = {"account": phone, "password": enc, "partner": int(partner), "itemuserfor": "freespin"}
+    st, resp = call_api("POST", H5, "/user/register/account", body, None, partner, False, src_login)
+    if st != 200 or resp.get("code") != 200:
+        r.append("Register FAIL: " + json.dumps(resp)[:300])
+        return False, "\n".join(r)
     r.append("Register: OK")
     time.sleep(1)
-    st, resp = do_call(H5,"/user/login/account","POST",{"account":phone,"password":enc},extra,None,False)
-    if st != 200 or resp.get("code") != 200: r.append("Login FAIL: "+str(resp)); return False, "\n".join(r)
+    st, resp = call_api("POST", H5, "/user/login/account", {"account": phone, "password": enc}, None, partner, False, src_login)
+    if st != 200 or resp.get("code") != 200:
+        r.append("Login FAIL: " + json.dumps(resp)[:300])
+        return False, "\n".join(r)
     token = resp.get("token")
     if not token: r.append("Login FAIL: no token"); return False, "\n".join(r)
     r.append("Login: OK")
-    ex2 = {"partner":partner,"sourceurl":src_uuid,"webrtc":"","access-token":token}
-    st,_ = do_call(H5,"/user/profile/getfreepackage","POST",{},ex2,token,False)
-    r.append("FreePkg: "+("OK" if st==200 else "FAIL"))
-    st,rc = do_call(H5,"/user/profile/claimRegisterGifts","POST",{},ex2,token,False)
-    r.append("Claim: "+("OK" if st==200 else "FAIL")+" "+json.dumps(rc)[:200])
-    st,_ = do_call(H5,"/user/profile/setlanguage","POST",{"language":"en-US"},ex2,token,False)
-    r.append("Lang: "+("OK" if st==200 else "FAIL"))
-    st,_ = do_call(GAME,"/freetinygames/freespin/subscribe","POST",{"typeid":"freespinbet10"},{},token,True)
-    r.append("Subscribe: "+("OK" if st==200 else "FAIL"))
+    r.append("")
+    r.append("--- Post-register ---")
+    st, resp = call_api("POST", H5, "/user/profile/getfreepackage", {}, token, partner, False, src_uuid)
+    r.append("FreePkg: " + ("OK" if st==200 else "FAIL") + " " + json.dumps(resp)[:150])
+    st, resp = call_api("POST", H5, "/user/profile/claimRegisterGifts", {}, token, partner, False, src_uuid)
+    r.append("Claim: " + ("OK" if st==200 else "FAIL") + " " + json.dumps(resp)[:150])
+    call_api("POST", H5, "/user/profile/setlanguage", {"language": "en-US"}, token, partner, False, src_uuid)
+    r.append("Lang: OK")
+    st, resp = call_api("POST", GAME, "/freetinygames/freespin/subscribe", {"typeid": "freespinbet10"}, token, None, True, "")
+    r.append("Subscribe: " + ("OK" if st==200 else "FAIL"))
+    r.append("")
+    r.append("--- 10 spins ---")
     tw = 0
     for i in range(10):
-        st,resp = do_call(GAME,"/freetinygames/freespin/bet","POST",{},{},token,True)
-        if st != 200: r.append(f"Spin {i+1}: FAIL"); break
-        lot = resp.get("lotteryGameResult",{}); gd = lot.get("data",{})
-        w = gd.get("win",0); b = gd.get("balance","?"); tc = resp.get("tycount","?")
-        tw += w if isinstance(w,(int,float)) else 0
-        r.append(f"Spin {i+1}/10: win={w} bal={b} left={tc}")
+        st, resp = call_api("POST", GAME, "/freetinygames/freespin/bet", {}, token, None, True, "")
+        if st != 200: r.append("Spin " + str(i+1) + ": FAIL"); break
+        lot = resp.get("lotteryGameResult", {}); gd = lot.get("data", {})
+        w = gd.get("win", 0); b = gd.get("balance", "?"); tc = resp.get("tycount", "?")
+        tw += w if isinstance(w, (int, float)) else 0
+        r.append("Spin " + str(i+1) + "/10: win=" + str(w) + " bal=" + str(b) + " left=" + str(tc))
         if tc == 0 and i < 9: break
         time.sleep(1)
-    r.append("Total win: "+str(tw)); r.append("Done! Phone: "+phone)
+    r.append("")
+    r.append("Total win: " + str(tw))
+    r.append("Phone: " + phone + " | Password: 123456")
     return True, "\n".join(r)
 
 async def cmd_start(update, context):
-    await update.message.reply_text("BetFugu Bot\n/register <link> - auto register + 10 spins")
-async def cmd_register(update, context):
-    if not context.args: await update.message.reply_text("Refer link do!"); return
-    msg = await update.message.reply_text("Processing...")
-    _, report = run_flow(" ".join(context.args))
-    await msg.edit_text(report[:4000])
-async def cmd_help(update, context):
-    await update.message.reply_text("/register <link>")
+    await update.message.reply_text(
+        "BetFugu Bot\n\n"
+        "/spin <phone> <password> - login + 10 free spins\n"
+        "Example: /spin 9469551049 123456\n\n"
+        "/register <link> - auto register + 10 spins\n"
+        "Example: /register https://s.betfugu01.com/ezzwvl51eipuy39"
+    )
 
-def run_tg():
-    tk = os.environ.get("BOT_TOKEN")
-    if not tk: print("No BOT_TOKEN"); return
-    print("Telegram starting...")
-    app = ApplicationBuilder().token(tk).build()
+async def cmd_spin(update, context):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /spin <phone> <password>\nExample: /spin 9469551049 123456")
+        return
+    phone = context.args[0]
+    password = context.args[1]
+    msg = await update.message.reply_text("Processing spins for " + phone + "...")
+    success, report = run_spins(phone, password)
+    for i in range(0, len(report), 4000):
+        chunk = report[i:i+4000]
+        if i == 0:
+            await msg.edit_text(chunk)
+        else:
+            await update.message.reply_text(chunk)
+
+async def cmd_register(update, context):
+    if not context.args:
+        await update.message.reply_text("Refer link do! /register <link>")
+        return
+    refer_link = " ".join(context.args)
+    msg = await update.message.reply_text("Processing...")
+    success, report = run_register(refer_link)
+    for i in range(0, len(report), 4000):
+        chunk = report[i:i+4000]
+        if i == 0:
+            await msg.edit_text(chunk)
+        else:
+            await update.message.reply_text(chunk)
+
+async def cmd_help(update, context):
+    await update.message.reply_text(
+        "/spin <phone> <password> - login + 10 free spins\n"
+        "/register <link> - auto register + 10 spins"
+    )
+
+def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        print("No BOT_TOKEN!")
+        return
+    print("BetFugu Bot starting...")
+    app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("spin", cmd_spin))
     app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("help", cmd_help))
     app.run_polling()
 
-def run_http():
-    port = int(os.environ.get("PORT", 8080))
-    hp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-    if not os.path.exists(hp): hp = "/app/index.html"
-    class H(http.server.BaseHTTPRequestHandler):
-        def _cors(self):
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "*")
-        def do_OPTIONS(self):
-            self.send_response(200); self._cors(); self.end_headers()
-        def do_GET(self):
-            if self.path in ("/","/index.html"):
-                try:
-                    with open(hp, encoding="utf-8") as f: c = f.read()
-                    self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self._cors(); self.end_headers()
-                    self.wfile.write(c.encode())
-                except Exception as e:
-                    self.send_response(500); self._cors(); self.end_headers()
-                    self.wfile.write(str(e).encode())
-            elif self.path.startswith("/api/"):
-                self._api("GET")
-            else:
-                self.send_response(404); self._cors(); self.end_headers()
-        def do_POST(self):
-            if self.path.startswith("/api/"): self._api("POST")
-            else: self.send_response(404); self._cors(); self.end_headers()
-        def _api(self, method):
-            try:
-                cl = int(self.headers.get("Content-Length", 0))
-                raw = self.rfile.read(cl) if cl > 0 else b"{}"
-                body = json.loads(raw.decode()) if raw else {}
-            except: body = {}
-            host = body.get("host",""); path = body.get("path","")
-            is_game = body.get("isGame", False); token = body.get("token","")
-            extra = body.get("headers",{}); ab = body.get("body",{})
-            if not host or not path:
-                self.send_response(400); self._cors(); self.end_headers()
-                self.wfile.write(b'{"error":"missing host/path"}'); return
-            st, resp = do_call(host, path, method, ab, extra, token, is_game)
-            out = json.dumps({"status": st, "data": resp}).encode()
-            self.send_response(200); self.send_header("Content-Type","application/json"); self._cors(); self.end_headers()
-            self.wfile.write(out)
-        def log_message(self, *a): pass
-    print(f"HTTP server on port {port}")
-    http.server.HTTPServer(("0.0.0.0", port), H).serve_forever()
-
-def main():
-    print("BetFugu Bot starting...")
-    t = threading.Thread(target=run_tg, daemon=True); t.start()
-    run_http()
-
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
