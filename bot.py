@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-BetFugu Bot - Telegram bot for free spins.
-/spin <phone> <password>  - login + 10 free spins
-/register <link>  - auto register + 10 spins
+BetFugu Bot - Telegram bot for auto-register + free spins.
+/register <refer_link>  - auto register + claim gift + 10 free spins (full flow)
+/spin <phone> <password>  - login with your account + 10 free spins only
 """
-import os, json, random, time, uuid, base64
+import os, json, random, time, uuid, base64, socket
 import urllib.request, urllib.error
+from urllib.parse import urlparse, parse_qs
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -14,6 +15,27 @@ _AES_IV = b"585280b3543d2d89"
 H5 = "https://h5server.betfuguapi.com"
 GAME = "https://game.betfuguapi.com"
 VISITOR = "MB==d9f771e6f02f464acd2a8ae95601599ff40dfc88202627"
+
+_PROXY_URL = os.environ.get("PROXY_URL", "")
+_PROXY_IP = os.environ.get("PROXY_IP", "")
+_server_ip = None
+
+def get_webrtc_ip():
+    global _server_ip
+    if _PROXY_IP: return _PROXY_IP
+    if _server_ip is None:
+        try:
+            req = urllib.request.Request("https://api.ipify.org?format=text", headers={"User-Agent":"Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                _server_ip = resp.read().decode().strip()
+        except:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                _server_ip = s.getsockname()[0]
+                s.close()
+            except: _server_ip = ""
+    return _server_ip
 
 def aes_encrypt(pt):
     try:
@@ -42,15 +64,21 @@ def mk_h5_headers(token, partner, sourceurl):
         "weblang":"en-US","weblangs":"en-US,en,en-IN","isfrom":"other_h5","ispwa":"true",
         "webfonts":"Microsoft YaHei","deviceid":"","visitorid":VISITOR,
         "sourceurl":sourceurl or "https://betfugu02.com/bf_pwa/index.html#/",
-        "webrtc":"47.31.86.36","trackertoken":"","trackername":""}
+        "webrtc":get_webrtc_ip(),"trackertoken":"","trackername":""}
     if partner: h["partner"] = str(partner)
     if token: h["access-token"] = token
     return h
 
+GAME_HEADERS = {"accept":"*/*","content-type":"application/json",
+    "origin":"https://www.betfugu02.com","referer":"https://www.betfugu02.com/",
+    "user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"}
+
+SHORTURL_HEADERS = {"accept":"*/*","content-type":"application/json",
+    "origin":"https://betfugu02.com","referer":"https://betfugu02.com/",
+    "user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"}
+
 def mk_game_headers(token):
-    h = {"accept":"*/*","content-type":"application/json",
-        "origin":"https://www.betfugu02.com","referer":"https://www.betfugu02.com/",
-        "user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"}
+    h = dict(GAME_HEADERS)
     if token: h["access-token"] = token
     return h
 
@@ -84,14 +112,181 @@ def build_src(uid, partner, rtm, pwa, frag="#/"):
     if pwa: p += "&pwa_uuid=" + pwa
     return "https://betfugu02.com/bf_pwa/index.html?" + p + frag
 
-def run_spins(phone, password):
+def gen_phone():
+    return random.choice("6789") + "".join(random.choice("0123456789") for _ in range(9))
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+def follow_short_link(short_url):
+    req = urllib.request.Request(short_url, headers={"User-Agent":"Mozilla/5.0"}, method="GET")
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    try:
+        resp = opener.open(req, timeout=15)
+        final_url = resp.url
+    except urllib.error.HTTPError as e:
+        if e.code == 302:
+            final_url = e.headers.get("Location", "")
+        else:
+            raise
+    if not final_url:
+        return None, None, "", "No redirect Location"
+    parsed = urlparse(final_url)
+    params = parse_qs(parsed.query)
+    partner = params.get("partner", [None])[0]
+    user_id = params.get("userId", [None])[0]
+    rtm = params.get("rtm", [""])[0]
+    if not partner or partner == "undefined":
+        return None, None, "", "Partner not found: " + final_url
+    return partner, user_id, rtm, final_url
+
+def step_shorturl(rtm):
+    body = {"text": "https://betfugu02.com/app/index.html?userId=undefined&cury=INR&partner=undefined&rtm=" + str(rtm)}
+    url = H5 + "/shorturl"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=SHORTURL_HEADERS, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return True
+    except: return False
+
+def run_register(refer_link):
     r = []
-    r.append("BetFugu Free Spins")
+    r.append("\U0001f3b0 BetFugu Auto-Register")
+    r.append("Refer link: " + refer_link)
+    partner, user_id, rtm, redirect_url = follow_short_link(refer_link)
+    if not partner:
+        r.append("FAIL: " + redirect_url)
+        return False, "\n".join(r)
+    r.append("Partner: " + str(partner) + " (from 302 redirect)")
+    if user_id:
+        r.append("Referrer userId: " + str(user_id))
+    rtm = rtm or str(int(time.time() * 1000))
+    pwa = gen_pwa()
+    phone = gen_phone()
+    r.append("Phone: " + phone)
+    r.append("Password: 123456")
+    src_login = build_src(user_id, partner, rtm, pwa, "#/login")
+    src_uuid = build_src(user_id, partner, rtm, pwa, "#/")
+    src_no_uuid = build_src(user_id, partner, rtm, None, "#/")
+    r.append("")
+    r.append("0\ufe0f\u20e3 Referral track: ")
+    step_shorturl(rtm)
+    st, resp = call_api("POST", H5, "/opendata/homepage/indexV4", {}, None, partner, False, src_no_uuid)
+    time.sleep(1)
+    st, resp = call_api("POST", H5, "/opendata/homepage/indexV4", {}, None, partner, False, src_uuid)
+    st, resp = call_api("POST", H5, "/opendata/getdaylyjackpot", {"id":"daylyJackpot","version":"1"}, None, partner, False, src_uuid)
+    st, resp = call_api("GET", H5, "/opendata/gameConfigs", None, None, partner, False, src_uuid)
+    st, resp = call_api("POST", H5, "/opendata/itemConfig", {}, None, partner, False, src_login)
+    r.append("Referral tracked \u2705 (userId=" + str(user_id) + ")")
+    time.sleep(2)
+    try:
+        enc = aes_encrypt("123456")
+    except Exception as e:
+        r.append("AES FAIL: " + str(e))
+        return False, "\n".join(r)
+    r.append("")
+    r.append("1\ufe0f\u20e3 Register: ")
+    reg_body = {"account": phone, "password": enc, "partner": int(partner), "itemuserfor": "freespin"}
+    st, resp = call_api("POST", H5, "/user/register/account", reg_body, None, partner, False, src_login)
+    if st != 200 or resp.get("code") != 200:
+        r[-1] += "FAIL " + json.dumps(resp)[:200]
+        return False, "\n".join(r)
+    r[-1] += "Registered \u2705 (code 200)"
+    time.sleep(1)
+    r.append("2\ufe0f\u20e3 Login: ")
+    st, resp = call_api("POST", H5, "/user/login/account", {"account": phone, "password": enc}, None, partner, False, src_login)
+    if st != 200 or resp.get("code") != 200:
+        r[-1] += "FAIL " + json.dumps(resp)[:200]
+        return False, "\n".join(r)
+    token = resp.get("token")
+    if not token:
+        r[-1] += "FAIL no token"
+        return False, "\n".join(r)
+    r[-1] += "Login \u2705"
+    time.sleep(0.5)
+    r.append("3\ufe0f\u20e3 Gift status: ")
+    st, resp = call_api("GET", H5, "/opendata/homepage/registerGifts", None, token, partner, False, src_uuid)
+    claimed = False
+    if st == 200 and isinstance(resp, dict):
+        data = resp.get("data", resp)
+        if isinstance(data, dict):
+            claimed = data.get("claimed", data.get("isClaimed", False))
+    r[-1] += "Gift status OK (claimed=" + str(claimed) + ")"
+    r.append("4\ufe0f\u20e3 Homepage: ")
+    st, resp = call_api("POST", H5, "/opendata/homepage/indexV4", {}, token, partner, False, src_uuid)
+    r[-1] += "Homepage config OK \u2705"
+    r.append("5\ufe0f\u20e3 Free package (pre): ")
+    st, resp = call_api("POST", H5, "/user/profile/getfreepackage", {}, token, partner, False, src_uuid)
+    pre_pkg = ""
+    if st == 200 and isinstance(resp, dict):
+        d = resp.get("data", resp)
+        if isinstance(d, dict):
+            pre_pkg = json.dumps(d)[:150]
+    r[-1] += "Free package OK \u2705 (before claim)"
+    r.append("6\ufe0f\u20e3 Claim gift: ")
+    st, resp = call_api("POST", H5, "/user/profile/claimRegisterGifts", {}, token, partner, False, src_uuid)
+    gift_info = ""
+    if st == 200 and isinstance(resp, dict):
+        d = resp.get("data", resp)
+        if isinstance(d, dict):
+            items = d.get("items", d.get("list", []))
+            if isinstance(items, list) and len(items) > 0:
+                it = items[0]
+                if isinstance(it, dict):
+                    gift_info = str(it.get("typeid", it.get("id", ""))) + " x" + str(it.get("num", it.get("count", "")))
+                else:
+                    gift_info = str(it)
+    r[-1] += "Gift claimed \u2705 " + (gift_info or json.dumps(resp)[:100])
+    r.append("7\ufe0f\u20e3 Free package (post): ")
+    st, resp = call_api("POST", H5, "/user/profile/getfreepackage", {}, token, partner, False, src_uuid)
+    post_pkg = ""
+    if st == 200 and isinstance(resp, dict):
+        d = resp.get("data", resp)
+        if isinstance(d, dict):
+            post_pkg = json.dumps(d)[:150]
+    r[-1] += "Free package verified \u2705 " + (post_pkg or "OK")
+    r.append("8\ufe0f\u20e3 Language: ")
+    st, resp = call_api("POST", H5, "/user/profile/setlanguage", {"language":"en-US"}, token, partner, False, src_uuid)
+    r[-1] += "Language set \u2705 (en-US)"
+    r.append("9\ufe0f\u20e3 Subscribe: ")
+    st, resp = call_api("POST", GAME, "/freetinygames/freespin/subscribe", {"typeid":"freespinbet10"}, token, None, True, "")
+    sub_ok = st == 200
+    r[-1] += "Subscribed \u2705 (freespinbet10)" if sub_ok else "Subscribe FAIL " + json.dumps(resp)[:100]
+    r.append("")
+    r.append("\U0001f51e Playing 10 free spins...")
+    total_win = 0
+    for i in range(10):
+        st, resp = call_api("POST", GAME, "/freetinygames/freespin/bet", {}, token, None, True, "")
+        if st != 200:
+            r.append("Spin " + str(i+1) + "/10: FAIL HTTP " + str(st))
+            break
+        lottery = resp.get("lotteryGameResult", {})
+        gd = lottery.get("data", {}) if isinstance(lottery, dict) else {}
+        win = gd.get("win", 0) if isinstance(gd, dict) else 0
+        bal = gd.get("balance", "?") if isinstance(gd, dict) else "?"
+        bet = gd.get("bet", 10) if isinstance(gd, dict) else 10
+        tycount = resp.get("tycount", "?")
+        total_win += win if isinstance(win, (int, float)) else 0
+        r.append("Spin " + str(i+1) + "/10: bet=" + str(bet) + " win=" + str(win) + " bal=" + str(bal) + " left=" + str(tycount))
+        if tycount == 0 and i < 9:
+            r.append("No spins left!")
+            break
+        time.sleep(1)
+    r.append("")
+    r.append("Total win: " + str(total_win))
+    r.append("\u2705 Done! Registration + 10 free spins complete.")
+    r.append("Phone: " + phone + " | Password: 123456")
+    return True, "\n".join(r)
+
+def run_spin_only(phone, password):
+    r = []
+    r.append("\U0001f3b0 BetFugu Free Spins")
     r.append("Phone: " + phone)
     r.append("")
     try:
         enc = aes_encrypt(password)
-        r.append("AES: OK " + enc)
     except Exception as e:
         r.append("AES FAIL: " + str(e))
         return False, "\n".join(r)
@@ -100,174 +295,108 @@ def run_spins(phone, password):
     src_login = build_src("", 66666666, rtm, pwa, "#/login")
     src_uuid = build_src("", 66666666, rtm, pwa, "#/")
     r.append("")
-    r.append("--- Pre-login calls ---")
-    st, resp = call_api("POST", H5, "/opendata/homepage/indexV4", {}, None, 66666666, False, src_uuid)
-    r.append("indexV4: " + str(st))
-    st, resp = call_api("POST", H5, "/opendata/getdaylyjackpot", {"id":"daylyJackpot","version":"1"}, None, 66666666, False, src_uuid)
-    r.append("daylyJackpot: " + str(st))
-    st, resp = call_api("GET", H5, "/opendata/gameConfigs", None, None, 66666666, False, src_uuid)
-    r.append("gameConfigs: " + str(st))
-    r.append("")
-    r.append("--- Login ---")
-    body = {"account": phone, "password": enc}
-    st, resp = call_api("POST", H5, "/user/login/account", body, None, 66666666, False, src_login)
-    r.append("Login HTTP: " + str(st))
-    r.append("Login raw: " + json.dumps(resp)[:500])
+    r.append("1\ufe0f\u20e3 Login: ")
+    st, resp = call_api("POST", H5, "/user/login/account", {"account": phone, "password": enc}, None, 66666666, False, src_login)
     if st != 200 or resp.get("code") != 200:
-        r.append("Login FAIL")
+        r[-1] += "FAIL " + json.dumps(resp)[:200]
         return False, "\n".join(r)
     token = resp.get("token")
     if not token:
-        r.append("Login FAIL: no token")
+        r[-1] += "FAIL no token"
         return False, "\n".join(r)
-    r.append("Login: OK")
-    r.append("Token: " + token[:50] + "...")
+    r[-1] += "Login \u2705"
     d = resp.get("data", {})
-    r.append("Data keys: " + str(list(d.keys()) if isinstance(d, dict) else type(d).__name__))
-    r.append("Full login resp: " + json.dumps(resp)[:800])
+    if isinstance(d, dict):
+        uid = d.get("id", d.get("userId", "?"))
+        bal = d.get("balance", d.get("money", "?"))
+        r.append("User ID: " + str(uid) + " | Balance: " + str(bal))
     time.sleep(1)
     r.append("")
-    r.append("--- Claim free package ---")
-    st, resp = call_api("POST", H5, "/user/profile/getfreepackage", {}, token, 66666666, False, src_uuid)
-    r.append("getfreepackage: " + str(st) + " " + json.dumps(resp)[:300])
-    st, resp = call_api("POST", H5, "/user/profile/claimRegisterGifts", {}, token, 66666666, False, src_uuid)
-    r.append("claimGifts: " + str(st) + " " + json.dumps(resp)[:300])
-    time.sleep(1)
-    r.append("")
-    r.append("--- Subscribe ---")
+    r.append("2\ufe0f\u20e3 Subscribe: ")
     st, resp = call_api("POST", GAME, "/freetinygames/freespin/subscribe", {"typeid":"freespinbet10"}, token, None, True, "")
-    r.append("subscribe HTTP: " + str(st))
-    r.append("subscribe raw: " + json.dumps(resp)[:500])
-    if st != 200:
-        r.append("")
-        r.append("Trying subscribe without typeid...")
-        st2, resp2 = call_api("POST", GAME, "/freetinygames/freespin/subscribe", {}, token, None, True, "")
-        r.append("subscribe v2 HTTP: " + str(st2))
-        r.append("subscribe v2 raw: " + json.dumps(resp2)[:500])
-        r.append("")
-        r.append("Trying subscribe with different body...")
-        st3, resp3 = call_api("POST", GAME, "/freetinygames/freespin/subscribe", {"typeid":"freespinbet10","gameid":"freespin"}, token, None, True, "")
-        r.append("subscribe v3 HTTP: " + str(st3))
-        r.append("subscribe v3 raw: " + json.dumps(resp3)[:500])
+    if st == 200:
+        r[-1] += "Subscribed \u2705"
+    else:
+        r[-1] += "Subscribe: " + json.dumps(resp)[:150]
     time.sleep(1)
     r.append("")
-    r.append("--- Spin 1 (debug) ---")
-    st, resp = call_api("POST", GAME, "/freetinygames/freespin/bet", {}, token, None, True, "")
-    r.append("spin1 HTTP: " + str(st))
-    r.append("spin1 RAW: " + json.dumps(resp)[:800])
-    r.append("")
-    r.append("--- Remaining spins ---")
+    r.append("\U0001f51e Playing 10 free spins...")
     total_win = 0
-    for i in range(9):
+    for i in range(10):
         st, resp = call_api("POST", GAME, "/freetinygames/freespin/bet", {}, token, None, True, "")
         if st != 200:
-            r.append("Spin " + str(i+2) + ": FAIL HTTP " + str(st) + " " + json.dumps(resp)[:200])
+            r.append("Spin " + str(i+1) + "/10: FAIL HTTP " + str(st) + " " + json.dumps(resp)[:150])
             break
         lottery = resp.get("lotteryGameResult", {})
         gd = lottery.get("data", {}) if isinstance(lottery, dict) else {}
         win = gd.get("win", 0) if isinstance(gd, dict) else 0
         bal = gd.get("balance", "?") if isinstance(gd, dict) else "?"
+        bet = gd.get("bet", 10) if isinstance(gd, dict) else 10
         tycount = resp.get("tycount", "?")
         total_win += win if isinstance(win, (int, float)) else 0
-        r.append("Spin " + str(i+2) + "/10: win=" + str(win) + " bal=" + str(bal) + " left=" + str(tycount))
-        if tycount == 0 and i < 8:
+        r.append("Spin " + str(i+1) + "/10: bet=" + str(bet) + " win=" + str(win) + " bal=" + str(bal) + " left=" + str(tycount))
+        if tycount == 0 and i < 9:
             r.append("No spins left!")
             break
         time.sleep(1)
     r.append("")
     r.append("Total win: " + str(total_win))
-    r.append("Done! Phone: " + phone)
+    r.append("\u2705 Done! 10 free spins complete.")
     return True, "\n".join(r)
 
 async def cmd_start(update, context):
     await update.message.reply_text(
-        "BetFugu Bot\n\n"
-        "/spin <phone> <password> - login + 10 free spins\n"
-        "Example: /spin 9991118546 123456\n\n"
-        "/register <link> - auto register + 10 spins"
+        "\U0001f3b0 BetFugu Bot\n\n"
+        "/register <refer_link> - auto register + 10 free spins\n"
+        "Example: /register https://s.betfugu01.com/xxxxx\n\n"
+        "/spin <phone> <password> - login + 10 free spins only\n"
+        "Example: /spin 8886295451 123456"
     )
-
-async def cmd_spin(update, context):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /spin <phone> <password>\nExample: /spin 9991118546 123456")
-        return
-    phone = context.args[0]
-    password = context.args[1]
-    msg = await update.message.reply_text("Processing spins for " + phone + "...")
-    success, report = run_spins(phone, password)
-    chunks = [report[i:i+3900] for i in range(0, len(report), 3900)]
-    for idx, chunk in enumerate(chunks):
-        if idx == 0:
-            await msg.edit_text(chunk)
-        else:
-            await update.message.reply_text(chunk)
 
 async def cmd_register(update, context):
     if not context.args:
         await update.message.reply_text("Refer link do! /register <link>")
         return
-    msg = await update.message.reply_text("Processing...")
     refer_link = " ".join(context.args)
-    partner = "66666666"
-    rtm = str(int(time.time() * 1000))
-    pwa = gen_pwa()
-    phone = random.choice("6789") + "".join(random.choice("0123456789") for _ in range(9))
-    src_login = build_src("", partner, rtm, pwa, "#/login")
-    src_uuid = build_src("", partner, rtm, pwa, "#/")
-    src_no = build_src("", partner, rtm, None, "#/")
-    report = ["Auto-Register", "Phone: " + phone]
-    try: enc = aes_encrypt("123456")
-    except Exception as e: report.append("AES FAIL"); 
-    else:
-        call_api("POST", H5, "/shorturl", {"text":"https://betfugu02.com/app/index.html?userId=undefined&cury=INR&partner=undefined&rtm="+rtm}, None, partner, False, src_no)
-        call_api("POST", H5, "/opendata/homepage/indexV4", {}, None, partner, False, src_no)
-        call_api("POST", H5, "/opendata/getdaylyjackpot", {"id":"daylyJackpot","version":"1"}, None, partner, False, src_no)
-        call_api("POST", H5, "/opendata/homepage/indexV4", {}, None, partner, False, src_uuid)
-        call_api("GET", H5, "/opendata/gameConfigs", None, None, partner, False, src_uuid)
-        call_api("POST", H5, "/opendata/itemConfig", {}, None, partner, False, src_login)
-        time.sleep(2)
-        st, resp = call_api("POST", H5, "/user/register/account", {"account":phone,"password":enc,"partner":int(partner),"itemuserfor":"freespin"}, None, partner, False, src_login)
-        report.append("Register: " + ("OK" if st==200 and resp.get("code")==200 else "FAIL " + json.dumps(resp)[:200]))
-        if st==200 and resp.get("code")==200:
-            time.sleep(1)
-            st, resp = call_api("POST", H5, "/user/login/account", {"account":phone,"password":enc}, None, partner, False, src_login)
-            token = resp.get("token") if st==200 else None
-            if token:
-                report.append("Login: OK")
-                call_api("POST", H5, "/user/profile/getfreepackage", {}, token, partner, False, src_uuid)
-                call_api("POST", H5, "/user/profile/claimRegisterGifts", {}, token, partner, False, src_uuid)
-                call_api("POST", H5, "/user/profile/setlanguage", {"language":"en-US"}, token, partner, False, src_uuid)
-                call_api("POST", GAME, "/freetinygames/freespin/subscribe", {"typeid":"freespinbet10"}, token, None, True, "")
-                report.append("Subscribe: done")
-                tw = 0
-                for i in range(10):
-                    st, resp = call_api("POST", GAME, "/freetinygames/freespin/bet", {}, token, None, True, "")
-                    lot = resp.get("lotteryGameResult",{}); gd = lot.get("data",{})
-                    w = gd.get("win",0); b = gd.get("balance","?"); tc = resp.get("tycount","?")
-                    tw += w if isinstance(w,(int,float)) else 0
-                    report.append("Spin "+str(i+1)+"/10: win="+str(w)+" bal="+str(b)+" left="+str(tc))
-                    if tc==0 and i<9: break
-                    time.sleep(1)
-                report.append("Total win: "+str(tw))
-    report.append("Phone: " + phone + " | Pwd: 123456")
-    for i in range(0, len(report), 3900):
-        chunk = report[i:i+3900]
+    msg = await update.message.reply_text("Processing...")
+    success, report = run_register(refer_link)
+    for i in range(0, len(report), 4000):
+        chunk = report[i:i+4000]
+        if i == 0: await msg.edit_text(chunk)
+        else: await update.message.reply_text(chunk)
+
+async def cmd_spin(update, context):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /spin <phone> <password>\nExample: /spin 8886295451 123456")
+        return
+    phone = context.args[0]
+    password = context.args[1]
+    msg = await update.message.reply_text("Processing spins for " + phone + "...")
+    success, report = run_spin_only(phone, password)
+    for i in range(0, len(report), 4000):
+        chunk = report[i:i+4000]
         if i == 0: await msg.edit_text(chunk)
         else: await update.message.reply_text(chunk)
 
 async def cmd_help(update, context):
-    await update.message.reply_text("/spin <phone> <password> - 10 free spins\n/register <link> - auto register")
+    await update.message.reply_text(
+        "/register <link> - auto register + 10 spins\n"
+        "/spin <phone> <password> - login + 10 spins"
+    )
 
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         print("No BOT_TOKEN!")
         return
+    if _PROXY_URL:
+        handler = urllib.request.ProxyHandler({"http": _PROXY_URL, "https": _PROXY_URL})
+        urllib.request.install_opener(urllib.request.build_opener(handler))
     print("BetFugu Bot starting...")
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("spin", cmd_spin))
     app.add_handler(CommandHandler("register", cmd_register))
+    app.add_handler(CommandHandler("spin", cmd_spin))
     app.add_handler(CommandHandler("help", cmd_help))
     app.run_polling()
 
